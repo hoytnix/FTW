@@ -86,15 +86,28 @@ under `scan` subcommand).
     (<source>)` lines. No schema change, no other new flags. `cargo build`
     / clippy / `cargo test` 93/93 green (78 unit + 15 CLI). Committed,
     tagged `v0.2.3`, and pushed.
-15. Phase 2 fingerprinting probe (`ftw probe`) + authoritative on-host check
+15. Release-workflow glibc fix applied (uncommitted): Linux .deb jobs moved
+    into a `rust:1-bookworm` container (glibc 2.36 baseline) so the arm64
+    .deb no longer requires GLIBC_2.38/2.39; Windows/macOS jobs unchanged.
+    Verified: YAML parses, `cargo build` / clippy clean, readelf confirms
+    new-glibc hosts bake in 2.38/2.39. Container proof runs in CI on next
+    tag push (no container runtime on this machine).
+16. `ftw host-check` now seeds from the master database (distinct IPs with
+    open ports via new `db::host_check_seeds`); the YAML inventory is gone
+    (`--inventory` rejected pointing at `--db`, `host_check.inventory`
+    config key removed, parser/credential-refusal code deleted). Verified:
+    build/clippy clean, 112/112 tests green (96 unit + 16 CLI), live smoke
+    of empty-seed warning and flag rejection. probe `--host-check` JSONL
+    merge unchanged. Left uncommitted.
+17. Phase 2 fingerprinting probe (`ftw probe`) + authoritative on-host check
     (`ftw host-check`) implemented and verified for authorized ranges only:
     new `src/probe.rs` (port-fixed scheme, single GET / with 32 KiB cap,
     cookie names only, X-Generator/Via/title/generator-meta/asset hints,
     same-pass TLS CN/SAN/issuer/not-after via capture verifier + x509-parser,
     favicon SHA-256, 16 KiB robots/sitemap presence+snippets, signal-count
     confidence, remote-version-hint-only with `unknown_from_remote`), new
-    `src/host_check.rs` (YAML inventory refusing credential keys, SSH
-    BatchMode with existing config/agent only, verbatim `php -v` + package
+    `src/host_check.rs` (DB-seeded hosts, SSH BatchMode with existing
+    config/agent only, verbatim `php -v` + package
     query, fixture-tested parsers, JSONL summaries merged by host), plus
     `probe_results`/`host_check_results` tables, single-writer streaming
     writers, `[probe]`/`[host_check]` config sections, and 20 new tests
@@ -104,6 +117,11 @@ under `scan` subcommand).
     `cargo test` 113/113 green (97 unit + 16 CLI). Changes left uncommitted.
 
 ## Recent state changes
+- 2026-10-23: README.md now documents the new fingerprinting tech (`ftw
+  probe` 0x05 + `ftw host-check` 0x06, `[probe]`/`[host_check]` config,
+  renumbered config/full-run/greetz sections, test count 93→113).
+  Verification green (build clean, clippy clean, 113/113 tests).
+  Left uncommitted.
 - 2026-10-23: Phase 2 probe (`ftw probe`) + `ftw host-check` complete and
   verified (build clean, clippy clean, 113/113 tests green). Left uncommitted.
 - 2026-10-23: bumped to v0.2.4 (Cargo.toml + README banner), committed

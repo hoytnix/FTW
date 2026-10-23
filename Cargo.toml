@@ -1,6 +1,6 @@
 [package]
 name = "ftw"
-version = "0.2.4"
+version = "0.2.5"
 edition = "2021"
 description = "Fuck Teh World (FTW) — Authorized Async TCP Port Scanner"
 authors = ["hoytnix"]

@@ -1,7 +1,8 @@
 //! Authoritative on-host patch records (`ftw host-check`) for authorized
 //! ranges only.
 //!
-//! Reads a host inventory file and, using the user's EXISTING SSH config and
+//! Seeds from the master database — distinct IPs with at least one open
+//! port — and, using the user's EXISTING SSH config and
 //! agent only, runs `php -v` plus the distro PHP package query on each host.
 //! SSH credentials are never embedded, accepted, or stored anywhere: not in
 //! code, not in config, not in output. Authentication uses
@@ -20,8 +21,6 @@
 //! records by host where available.
 
 use std::collections::HashMap;
-use std::fmt;
-use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
@@ -104,156 +103,6 @@ pub fn format_summary(stats: &HostCheckStats) -> String {
         "ftw: host-checked {} hosts: {} ok, {} errors; php present on {}",
         stats.total, stats.ok, stats.errors, stats.with_php,
     )
-}
-
-/// Failure to load or parse a host inventory file.
-#[derive(Debug)]
-pub enum InventoryError {
-    Io(std::io::Error),
-    Yaml(String),
-    Entry(String),
-}
-
-impl fmt::Display for InventoryError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(err) => write!(f, "cannot read host inventory file: {err}"),
-            Self::Yaml(err) => write!(f, "invalid YAML host inventory file: {err}"),
-            Self::Entry(err) => write!(f, "{err}"),
-        }
-    }
-}
-
-impl std::error::Error for InventoryError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(err) => Some(err),
-            Self::Yaml(_) | Self::Entry(_) => None,
-        }
-    }
-}
-
-impl From<std::io::Error> for InventoryError {
-    fn from(err: std::io::Error) -> Self {
-        Self::Io(err)
-    }
-}
-
-/// On-disk shape: `{ hosts: [...] }` or a top-level sequence. Entries are
-/// plain host strings (`host.example.com`, `192.0.2.5`) or `{ host, port? }`
-/// maps. Any credential-looking key (`password`, `passphrase`, `secret`,
-/// ...) is refused outright: this tool never accepts SSH credentials.
-#[derive(Debug, serde::Deserialize)]
-#[serde(untagged)]
-enum InventoryDoc {
-    Map { hosts: Vec<InventoryEntry> },
-    Seq(Vec<InventoryEntry>),
-}
-
-#[derive(Debug, serde::Deserialize)]
-#[serde(untagged)]
-enum InventoryEntry {
-    Host(String),
-    Detailed {
-        host: String,
-        #[allow(dead_code)]
-        port: Option<u16>,
-    },
-}
-
-/// Credential-looking YAML keys. Their presence in ANY entry is a hard
-/// error — credentials are never accepted, let alone stored.
-const FORBIDDEN_KEYS: &[&str] = &[
-    "password",
-    "passphrase",
-    "pass",
-    "secret",
-    "private_key",
-    "privatekey",
-    "identity_file",
-    "key",
-];
-
-/// Load, parse, and validate a host inventory file.
-pub fn load_inventory(path: &Path) -> Result<Vec<String>, InventoryError> {
-    let text = std::fs::read_to_string(path)?;
-    parse_inventory(&text)
-}
-
-/// Parse and validate inventory YAML text.
-pub fn parse_inventory(text: &str) -> Result<Vec<String>, InventoryError> {
-    reject_forbidden_keys(text)?;
-    let doc: InventoryDoc =
-        serde_yml::from_str(text).map_err(|err| InventoryError::Yaml(err.to_string()))?;
-    let entries = match doc {
-        InventoryDoc::Map { hosts } => hosts,
-        InventoryDoc::Seq(entries) => entries,
-    };
-    let mut hosts = Vec::with_capacity(entries.len());
-    for entry in &entries {
-        let host = match entry {
-            InventoryEntry::Host(host) => host.clone(),
-            InventoryEntry::Detailed { host, .. } => host.clone(),
-        };
-        let host = host.trim().to_owned();
-        if host.is_empty() {
-            return Err(InventoryError::Entry(
-                "host inventory entry must not be empty".to_string(),
-            ));
-        }
-        if host.contains(char::is_whitespace) || host.contains('@') || host.contains(':') {
-            // `user@host`, embedded credentials/ports, and multi-word
-            // entries are refused: the entry must be a bare hostname or IP.
-            // (Bare IPv6 literals contain ':' — use their unbracketed form
-            // only via scan targets, not here.)
-            if host.parse::<SocketAddr>().is_err() && host.parse::<std::net::IpAddr>().is_ok() {
-                hosts.push(host);
-                continue;
-            }
-            return Err(InventoryError::Entry(format!(
-                "invalid host entry {host:?}: use a bare hostname or IP (no user@, no embedded credentials)"
-            )));
-        }
-        hosts.push(host);
-    }
-    hosts.sort();
-    hosts.dedup();
-    Ok(hosts)
-}
-
-/// Refuse credential-looking keys before deserialization drops them: scan
-/// the raw mapping keys so a `password:` entry can never slip through as an
-/// ignored field.
-fn reject_forbidden_keys(text: &str) -> Result<(), InventoryError> {
-    let value: serde_yml::Value =
-        serde_yml::from_str(text).map_err(|err| InventoryError::Yaml(err.to_string()))?;
-    let mut found = Vec::new();
-    fn walk(value: &serde_yml::Value, found: &mut Vec<String>) {
-        if let Some(map) = value.as_mapping() {
-            for (key, val) in map {
-                if FORBIDDEN_KEYS.iter().any(|bad| key.eq_ignore_ascii_case(bad)) {
-                    found.push(key.clone());
-                }
-                walk(val, found);
-            }
-        } else if let Some(seq) = value.as_sequence() {
-            for item in seq {
-                walk(item, found);
-            }
-        }
-    }
-    walk(&value, &mut found);
-    if found.is_empty() {
-        Ok(())
-    } else {
-        found.sort();
-        found.dedup();
-        Err(InventoryError::Entry(format!(
-            "host inventory must not contain credentials (found key(s): {}); \
-             ftw host-check uses your existing SSH config and agent only",
-            found.join(", ")
-        )))
-    }
 }
 
 /// Parse `major.minor.patch` out of `php -v` output: the token after `PHP`
@@ -408,21 +257,26 @@ pub fn summaries_from_jsonl(path: &Path) -> Result<HashMap<String, HostCheckSumm
     Ok(map)
 }
 
-/// Check every inventory host, streaming one JSON record per host as it
-/// arrives — the whole run is never buffered.
+/// Check every host with an open port in the master database, streaming
+/// one JSON record per host as it arrives — the whole run is never
+/// buffered.
 pub async fn run_with_options(
     config: &HostCheckConfig,
-    inventory: Vec<String>,
     db_path: PathBuf,
     options: output::OutputOptions,
 ) -> Result<HostCheckStats, Box<dyn std::error::Error + Send + Sync>> {
     let conn = crate::db::open(&db_path)?;
-    eprintln!("ftw: host-checking {} hosts", inventory.len());
+    let hosts = crate::db::host_check_seeds(&conn)?;
+    if hosts.is_empty() {
+        eprintln!("ftw: warning: no hosts to check");
+    } else {
+        eprintln!("ftw: host-checking {} hosts", hosts.len());
+    }
     let (tx, rx) = mpsc::channel::<HostCheckRecord>(CHANNEL_CAPACITY);
     let writer =
         tokio::spawn(async move { output::run_host_check_db_writer(rx, conn, options).await });
     let semaphore = Arc::new(Semaphore::new(config.concurrency.max(1)));
-    for host in inventory {
+    for host in hosts {
         let permit = semaphore
             .clone()
             .acquire_owned()
@@ -494,30 +348,6 @@ mod tests {
         let (php, packages) = split_remote_output("no marker here");
         assert_eq!(php, "no marker here");
         assert!(packages.is_empty());
-    }
-
-    #[test]
-    fn inventory_parses_map_and_sequence_shapes() {
-        let hosts = parse_inventory("hosts:\n  - web1.example.com\n  - 192.0.2.5\n")
-            .expect("map shape");
-        assert_eq!(hosts, vec!["192.0.2.5".to_string(), "web1.example.com".to_string()]);
-        let hosts = parse_inventory("- web1.example.com\n- host: db1.example.com\n")
-            .expect("sequence shape with detailed entry");
-        assert_eq!(hosts, vec!["db1.example.com".to_string(), "web1.example.com".to_string()]);
-        // Duplicates collapse.
-        let hosts = parse_inventory("- a.example.com\n- a.example.com\n").expect("dedup");
-        assert_eq!(hosts, vec!["a.example.com".to_string()]);
-    }
-
-    #[test]
-    fn inventory_refuses_credentials_and_user_at_hosts() {
-        let err = parse_inventory("hosts:\n  - host: web1.example.com\n    password: s3cret\n")
-            .expect_err("password key must be refused");
-        assert!(err.to_string().contains("credentials"), "names the reason: {err}");
-        let err = parse_inventory("- deploy@web1.example.com\n")
-            .expect_err("user@host must be refused");
-        assert!(err.to_string().contains("user@"), "names the reason: {err}");
-        assert!(parse_inventory("hosts:\n  - \"\"\n").is_err(), "empty host refused");
     }
 
     #[test]

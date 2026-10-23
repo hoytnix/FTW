@@ -171,6 +171,25 @@ pub fn upsert_scan(
     Ok(())
 }
 
+/// Distinct host IPs with at least one `open` port — the host-check seed
+/// set. Hosts are SSHed directly, so only the IP string is needed.
+/// Unparseable rows are skipped (the writer only stores valid `IpAddr`s,
+/// so this is purely defensive).
+pub fn host_check_seeds(conn: &Connection) -> Result<Vec<String>, rusqlite::Error> {
+    let mut stmt = conn.prepare("SELECT DISTINCT ip FROM scan_results WHERE status = 'open'")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let ip = row?;
+        if ip.parse::<IpAddr>().is_ok() {
+            out.push(ip);
+        }
+    }
+    out.sort_unstable();
+    out.dedup();
+    Ok(out)
+}
+
 /// Every `(ip, port)` currently marked `open` — the fingerprint seed set.
 /// Rows with unparseable addresses are skipped (the writer only stores
 /// valid `IpAddr`s, so this is purely defensive).
@@ -485,6 +504,28 @@ mod tests {
         let seeds = open_ports(&conn).expect("seed query");
         assert_eq!(seeds.len(), 1);
         assert_eq!(seeds[0].1, 80);
+        std::fs::remove_file(&path).ok();
+    }
+
+    #[test]
+    fn host_check_seeds_are_distinct_open_ips_only() {
+        let path = temp_db("hc-seeds");
+        let conn = open(&path).expect("open db");
+        for (ip, port, status) in [
+            ("127.0.0.1", 80u16, crate::scanner::PortStatus::Open),
+            ("127.0.0.1", 443u16, crate::scanner::PortStatus::Open),
+            ("127.0.0.2", 80u16, crate::scanner::PortStatus::Closed),
+            ("127.0.0.3", 22u16, crate::scanner::PortStatus::Filtered),
+            ("127.0.0.4", 443u16, crate::scanner::PortStatus::Open),
+        ] {
+            upsert_scan(&conn, &scan_result(ip, port, status)).expect("insert");
+        }
+        let seeds = host_check_seeds(&conn).expect("seed query");
+        assert_eq!(
+            seeds,
+            vec!["127.0.0.1".to_string(), "127.0.0.4".to_string()],
+            "one row per open host, closed/filtered excluded"
+        );
         std::fs::remove_file(&path).ok();
     }
 

@@ -182,7 +182,6 @@ pub struct ProbeSection {
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
 pub struct HostCheckSection {
-    pub inventory: Option<PathBuf>,
     pub concurrency: Option<usize>,
     pub timeout: Option<TimeoutSecs>,
     pub verbose: Option<bool>,
@@ -243,7 +242,6 @@ fn section_fields(section: &str) -> &'static [&'static str] {
             "quiet",
         ],
         "host-check" | "host_check" => &[
-            "inventory",
             "concurrency",
             "timeout",
             "verbose",

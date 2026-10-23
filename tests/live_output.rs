@@ -523,8 +523,6 @@ fn verbose_and_quiet_conflict_on_all_subcommands() {
     let host_check = Command::new(ftw_bin())
         .args([
             "host-check",
-            "--inventory",
-            "/nonexistent-inventory.yml",
             "--db",
             &db_path.to_string_lossy(),
             "--verbose",
@@ -610,6 +608,26 @@ fn removed_file_flags_are_rejected() {
         String::from_utf8_lossy(&fingerprint_scan.stderr).contains("--db"),
         "rejection must point at --db: {}",
         String::from_utf8_lossy(&fingerprint_scan.stderr)
+    );
+
+    let host_check_inventory = Command::new(ftw_bin())
+        .args([
+            "host-check",
+            "--db",
+            &db_path.to_string_lossy(),
+            "--inventory",
+            &legacy.to_string_lossy(),
+        ])
+        .output()
+        .expect("run host-check with --inventory");
+    assert!(
+        !host_check_inventory.status.success(),
+        "--inventory must be rejected for host-check"
+    );
+    assert!(
+        String::from_utf8_lossy(&host_check_inventory.stderr).contains("--db"),
+        "rejection must point at --db: {}",
+        String::from_utf8_lossy(&host_check_inventory.stderr)
     );
 
     std::fs::remove_file(&yaml_path).ok();

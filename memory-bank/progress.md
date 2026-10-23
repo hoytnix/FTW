@@ -100,5 +100,12 @@
 ## Roadmap
 - Done: Phase 2 implementation, tests, live loopback scan→probe smoke test,
   tech fingerprinting, HEAD-first optimization (all committed and pushed),
-  tag-triggered release workflow. Release-workflow changes left uncommitted
-  in the working tree for review.
+  tag-triggered release workflow. Release-workflow glibc fix (Linux .debs
+  in `rust:1-bookworm` container, glibc 2.36 baseline) left uncommitted
+  in the working tree for review; takes effect on next tag push.
+- Done: `ftw host-check` seeds from `--db` (no YAML inventory; `--inventory`
+  rejected pointing at `--db`). Build/clippy clean, 112/112 tests green
+  (96 unit + 16 CLI). Left uncommitted.
+- Done 2026-10-23: README.md documents `ftw probe` + `ftw host-check`
+  (behavior, flags, inventory rules, `[probe]`/`[host_check]` config, DB
+  tables, full-run queries). Left uncommitted.

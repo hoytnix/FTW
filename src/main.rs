@@ -263,13 +263,13 @@ struct ProbeArgs {
     quiet: bool,
 }
 
-/// Host-check flags. Hosts come from the inventory file; checks run over
-/// SSH with BatchMode=yes using your existing SSH config and agent only.
+/// Host-check flags. Hosts are seeded from the master database
+/// (distinct IPs with open ports); checks run over SSH with BatchMode=yes
+/// using your existing SSH config and agent only.
 #[derive(Debug, Args)]
 struct HostCheckArgs {
-    /// Host inventory file (YAML: `{ hosts: [...] }` or a top-level
-    /// sequence of bare hostnames/IPs; credential keys are refused)
-    #[arg(long, value_name = "FILE")]
+    /// Removed: hosts are seeded from `--db`, not from an inventory file.
+    #[arg(long, value_name = "FILE", hide = true)]
     inventory: Option<PathBuf>,
 
     /// Maximum number of SSH sessions in flight at once (default 16)
@@ -325,6 +325,20 @@ fn reject_removed_file_flag(flag: &str) -> ! {
             clap::error::ErrorKind::UnknownArgument,
             format!(
                 "{flag} is no longer supported: results now live in --db (default ftw.db); \
+                 run `ftw scan --db <FILE>` first and pass the same --db file here"
+            ),
+        )
+        .exit()
+}
+
+/// Reject a removed seed flag with a clap usage error: hosts are now seeded
+/// from `--db`, and the old flag is not accepted as a parallel option.
+fn reject_removed_seed_flag(flag: &str) -> ! {
+    Cli::command()
+        .error(
+            clap::error::ErrorKind::UnknownArgument,
+            format!(
+                "{flag} is no longer supported: hosts are now seeded from --db (default ftw.db); \
                  run `ftw scan --db <FILE>` first and pass the same --db file here"
             ),
         )
@@ -670,24 +684,15 @@ async fn run_probe(cli: ProbeArgs) -> Result<(), Box<dyn std::error::Error + Sen
 async fn run_host_check(
     cli: HostCheckArgs,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if cli.inventory.is_some() {
+        reject_removed_seed_flag("--inventory");
+    }
     let cfg_path = config::discover(cli.config.as_deref())?;
     let file = match &cfg_path {
         Some(path) => config::load(path)?,
         None => config::FileConfig::default(),
     };
     let cfg = &file.host_check;
-    let (inventory_path, inventory_src) = match (cli.inventory, cfg.inventory.clone()) {
-        (Some(value), _) => (Some(value), Source::Cli),
-        (None, Some(value)) => (Some(value), Source::Config),
-        (None, None) => (None, Source::Default),
-    };
-    let Some(inventory_path) = inventory_path else {
-        return Err(
-            "no host inventory: pass --inventory <FILE> or set host_check.inventory in the config file"
-                .to_string()
-                .into(),
-        );
-    };
     let (concurrency, concurrency_src) = config::resolve(cli.concurrency, cfg.concurrency, 16);
     let (timeout_secs, timeout_src) = config::resolve(cli.timeout, cfg.timeout.map(|t| t.0), 15.0);
     let (db, db_src) = config::resolve(
@@ -711,22 +716,17 @@ async fn run_host_check(
     config::require_positive_seconds("host-check", "timeout", timeout_secs, timeout_src, cfg_ref)?;
     let timeout = check_timeout(timeout_secs)?;
     if verbose {
-        eprintln!("{}", config::line("host-check", "inventory", &inventory_path.display().to_string(), inventory_src));
         eprintln!("{}", config::line("host-check", "concurrency", &concurrency.to_string(), concurrency_src));
         eprintln!("{}", config::line("host-check", "timeout", &timeout_secs.to_string(), timeout_src));
         let db_section = if db_src == Source::Config { "global" } else { "host-check" };
         eprintln!("{}", config::line(db_section, "db", &db.display().to_string(), db_src));
-    }
-    let inventory = host_check::load_inventory(&inventory_path)?;
-    if inventory.is_empty() {
-        eprintln!("ftw: warning: no hosts to check");
     }
     let check_config = host_check::HostCheckConfig {
         concurrency,
         timeout,
     };
     let options = output::OutputOptions::new(verbose, quiet);
-    let stats = host_check::run_with_options(&check_config, inventory, db, options).await?;
+    let stats = host_check::run_with_options(&check_config, db, options).await?;
     eprintln!("{}", host_check::format_summary(&stats));
     Ok(())
 }
