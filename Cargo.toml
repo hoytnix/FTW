@@ -2,10 +2,19 @@
 name = "ftw"
 version = "0.1.0"
 edition = "2021"
+description = "Fuck Teh World (FTW) — Authorized Async TCP Port Scanner"
+authors = ["hoytnix"]
 
 [[bin]]
 name = "ftw"
 path = "src/main.rs"
+
+# Metadata for `cargo packager`, used by .github/workflows/release.yml.
+# Product name and bundle identifier; everything else (version, description,
+# binary list) is derived from [package] above.
+[package.metadata.packager]
+product-name = "FTW"
+identifier = "com.tehwiz.ftw"
 
 [dependencies]
 tokio = { version = "1", features = ["full"] }

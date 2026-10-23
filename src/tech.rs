@@ -16,7 +16,8 @@
 //! `Link` response headers are parsed into the same `(href, rel)` shape as
 //! HTML `<link>` tags, so header signals count whether they arrive on HEAD
 //! or on GET. `head_identifies_app` reports when HEAD headers alone
-//! definitively identify the application and the GET can be skipped.
+//! definitively identify the application (informational only: fetch mode is
+//! chosen explicitly by `--fetch-mode`, never by automatic skipping).
 //!
 //! Known limitations (by design, not bugs):
 //! - Only the first [`MAX_PREVIEW_BYTES`] (64 KiB) bytes of a body are
@@ -190,13 +191,15 @@ fn parse_link_rel(segment: &str) -> Option<String> {
     None
 }
 
-/// True when HEAD headers alone definitively identify the application, so
-/// the GET can be skipped: a `Link` header for `/wp-json/` with rel
-/// `https://api.w.org/` (WordPress), or any `X-Magento-*` header (Magento).
-/// Keep in sync with the `wp-json` match in [`wordpress`] and the
-/// `x-magento-header` match in [`php_apps`]. PHP-only headers
-/// (`X-Powered-By`, PHPSESSID) are NOT sufficient: application and Tailwind
-/// signals live in the HTML, so those still require the GET.
+/// True when HEAD headers alone definitively identify the application: a
+/// `Link` header for `/wp-json/` with rel `https://api.w.org/` (WordPress),
+/// or any `X-Magento-*` header (Magento). Keep in sync with the `wp-json`
+/// match in [`wordpress`] and the `x-magento-header` match in [`php_apps`].
+/// PHP-only headers (`X-Powered-By`, PHPSESSID) are NOT sufficient:
+/// application and Tailwind signals live in the HTML. Informational only —
+/// the probe never skips GET automatically; `--fetch-mode` decides.
+/// Retained for tests and callers inspecting header-only identifiability.
+#[allow(dead_code)]
 pub fn head_identifies_app(headers: &HeaderMap) -> bool {
     if headers
         .keys()

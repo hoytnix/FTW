@@ -90,6 +90,10 @@ struct ProbeArgs {
     /// Maximum response body bytes to read per scheme attempt
     #[arg(long, value_name = "BYTES", default_value_t = 8192)]
     body_cap: usize,
+
+    /// Which HTTP method(s) to send per scheme attempt
+    #[arg(long, value_enum, default_value_t = probe::FetchMode::Get)]
+    fetch_mode: probe::FetchMode,
 }
 
 const CHANNEL_CAPACITY: usize = 1024;
@@ -148,6 +152,7 @@ async fn run_probe(cli: ProbeArgs) -> Result<(), Box<dyn std::error::Error + Sen
         insecure: cli.insecure,
         max_redirects: cli.max_redirects,
         body_cap: cli.body_cap,
+        fetch_mode: cli.fetch_mode,
     };
     let stats = probe::run(&config, &cli.scan_output, cli.output).await?;
     eprintln!(

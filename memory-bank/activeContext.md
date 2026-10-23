@@ -23,8 +23,17 @@ under `scan` subcommand).
    green (11 pre-existing + 9 new tech tests). Committed and pushed (888cfc4).
 6. HEAD-first optimization applied and verified: `cargo build` clean,
    `cargo clippy --all-targets -- -D warnings` clean, `cargo test` 26/26
-   green (20 pre-existing + 6 new HEAD-first tests). Changes left uncommitted.
-7. Sync this file + progress.md; leave changes uncommitted for review.
+   green (20 pre-existing + 6 new HEAD-first tests). Committed and pushed
+   (024de5b).
+7. Fetch-mode improvement applied and verified (supersedes HEAD-first):
+   explicit `--fetch-mode get|head|both` (default `get`), auto-skip removed,
+   `cargo build` clean, `cargo clippy --all-targets -- -D warnings` clean,
+   `cargo test` 30/30 green (22 pre-existing + 8 new fetch-mode tests).
+7. Release workflow added (`.github/workflows/release.yml`, tag `v*` →
+   deb/nsis/dmg via cargo-packager) plus minimal packager metadata in
+   `Cargo.toml` (identifier `com.tehwiz.ftw`); YAML/manifest/build/clippy/
+   test all verified locally. Changes left uncommitted.
+8. Sync this file + progress.md; leave changes uncommitted for review.
 
 ## Recent state changes
 - 2026-10-23: added hacker-zine README.md + Kopimi LICENSE; banner swapped

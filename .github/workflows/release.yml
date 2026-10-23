@@ -1,0 +1,82 @@
+name: Release FTW
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-package:
+    name: Package on ${{ matrix.os }} (${{ matrix.target }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Linux x86_64 (amd64)
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            format: deb
+          # Linux ARM64 (arm64)
+          - os: ubuntu-latest
+            target: aarch64-unknown-linux-gnu
+            format: deb
+          # Windows x86_64
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+            format: nsis
+          # macOS Apple Silicon (aarch64)
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            format: dmg
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      # Cross-compilation tools for Linux ARM64 on x86_64 Ubuntu runner
+      - name: Install ARM64 GCC Linker (Linux)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu g++-aarch64-linux-gnu
+
+      - name: Install cargo-binstall
+        uses: cargo-bins/cargo-binstall@main
+
+      - name: Install cargo-packager
+        run: cargo binstall cargo-packager --no-confirm
+
+      # Step 1: Pre-compile binary directly to target path
+      - name: Compile Rust binary
+        run: cargo build --release --target ${{ matrix.target }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      # Step 2: Package installer using pre-built binary
+      - name: Generate Installer
+        run: cargo packager --release --target ${{ matrix.target }} -f ${{ matrix.format }}
+        env:
+          CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER: aarch64-linux-gnu-gcc
+
+      # Step 3: Direct Upload to GitHub Release
+      - name: Publish Asset to Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/**/release/*.deb
+            target/**/release/*setup.exe
+            target/**/release/*.dmg
+            target/release/*.deb
+            target/release/*setup.exe
+            target/release/*.dmg
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
