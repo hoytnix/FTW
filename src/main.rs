@@ -15,7 +15,7 @@ use scanner::ScanResult;
 #[derive(Debug, Parser)]
 #[command(
     name = "FTW",
-    about = "Fuck The World (FTW) — Authorized Async TCP Port Scanner",
+    about = "Fuck Teh World (FTW) — Authorized Async TCP Port Scanner",
     version
 )]
 struct Cli {

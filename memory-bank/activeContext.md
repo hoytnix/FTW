@@ -17,6 +17,10 @@ behavior and output format unchanged (flags moved under `scan` subcommand).
 5. Sync this file + progress.md; leave changes uncommitted for review.
 
 ## Recent state changes
+- 2026-10-23: added hacker-zine README.md + Kopimi LICENSE; banner swapped
+  to user-supplied dollar-sign FTW art. Left uncommitted.
+- 2026-10-23: rebranded "Fuck The World" to "Fuck Teh World" (CLI about +
+  project brief); tests 11/11 green. Left uncommitted.
 - 2026-10-23: Phase 2 implementation complete and verified (build clean,
   clippy clean, 11/11 tests green). Known non-issue: `cargo fmt --check`
   with the newer 1.99 rustfmt reports style drift even in untouched Phase 1

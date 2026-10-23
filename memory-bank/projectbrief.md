@@ -1,4 +1,4 @@
-# Project Brief — FTW (Fuck The World) Port Scanner
+# Project Brief — FTW (Fuck Teh World) Port Scanner
 
 ## Core goal
 Build a Rust async TCP port scanner named `ftw` for authorized IP ranges only
@@ -6,7 +6,7 @@ Build a Rust async TCP port scanner named `ftw` for authorized IP ranges only
 
 ## Scope
 - Crate/binary name `ftw`; CLI brand "FTW", about/title
-  "Fuck The World (FTW) — Authorized Async TCP Port Scanner".
+  "Fuck Teh World (FTW) — Authorized Async TCP Port Scanner".
 - Clap-derived CLI: YAML input, ports (default 80,443), concurrency limit,
   timeout (default 2s), output file.
 - YAML targets via serde + serde_yml; CIDR/Single-IP parsing with ipnet;
