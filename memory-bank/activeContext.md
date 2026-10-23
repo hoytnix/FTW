@@ -1,19 +1,25 @@
 # Active Context — FTW
 
 ## Current focus
-Initial build of the `ftw` authorized async TCP port scanner per the request
-spec (CLI, lazy targets, semaphore-gated scan, streaming writer, loopback test).
+Phase 2 (`ftw probe`) built and verified: HTTP/HTTPS probing of open ports
+from Phase 1 scan output, with passive PHP fingerprinting. Phase 1 `scan`
+behavior and output format unchanged (flags moved under `scan` subcommand).
 
 ## Active work stream
-1. Write Cargo.toml + 4 modules.
-2. Add loopback test (sample YAML → ephemeral listener → open + closed ports
-   → verify streamed output file).
-3. Verify: `cargo build`, `cargo clippy -- -D warnings`, `cargo test`.
-4. Sync this file + progress.md; leave changes uncommitted for review.
+1. Restructured CLI into `scan` / `probe` subcommands (clap derive).
+2. Added `src/probe.rs` (scan-output parsing, HTTPS-first/auto logic, TLS
+   classification, PHP fingerprinting, semaphore-gated pipeline) and a JSON
+   streaming writer in `src/output.rs`.
+3. Crates added: reqwest (rustls-tls, no default features) + serde_json.
+4. Verified: `cargo build` clean, `cargo clippy --all-targets -- -D warnings`
+   clean (via rustup stable 1.99.1 toolchain installed for the gate),
+   `cargo test` 11/11 green, live loopback smoke of scan→probe.
+5. Sync this file + progress.md; leave changes uncommitted for review.
 
 ## Recent state changes
-- 2026-10-23: memory bank initialized (was missing); starting implementation.
-- 2026-10-23: implementation complete and verified (build clean, 4/4 tests
-  green). Known gap: `cargo clippy` unrunnable here (no rustup, no sudo for
-  apt); code kept to default-lint-clean style and `cargo build --all-targets`
-  shows 0 warnings. Changes left uncommitted for review.
+- 2026-10-23: Phase 2 implementation complete and verified (build clean,
+  clippy clean, 11/11 tests green). Known non-issue: `cargo fmt --check`
+  with the newer 1.99 rustfmt reports style drift even in untouched Phase 1
+  files (import ordering/line collapsing), so no reformat was applied; new
+  code matches the repo's existing style. Changes left uncommitted.
+- 2026-10-23: Phase 1 implementation complete (build clean, 4/4 tests green).

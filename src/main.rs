@@ -1,13 +1,15 @@
 mod output;
+mod probe;
 mod scanner;
 mod targets;
 
 use std::path::PathBuf;
 use std::time::Duration;
 
-use clap::Parser;
+use clap::{Args, Parser, Subcommand};
 use tokio::sync::mpsc;
 
+use probe::Scheme;
 use scanner::ScanResult;
 
 #[derive(Debug, Parser)]
@@ -17,6 +19,21 @@ use scanner::ScanResult;
     version
 )]
 struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Debug, Subcommand)]
+enum Commands {
+    /// Run the Phase 1 authorized TCP port scan.
+    Scan(ScanArgs),
+    /// Probe open ports from a scan-output file over HTTP/HTTPS.
+    Probe(ProbeArgs),
+}
+
+/// Phase 1 scan flags (unchanged apart from moving under `scan`).
+#[derive(Debug, Args)]
+struct ScanArgs {
     /// YAML file listing authorized target CIDRs or single IPs
     #[arg(short, long, value_name = "FILE")]
     input: PathBuf,
@@ -38,18 +55,58 @@ struct Cli {
     output: PathBuf,
 }
 
+/// Phase 2 probe flags.
+#[derive(Debug, Args)]
+struct ProbeArgs {
+    /// Phase 1 scan-output file to read open ports from
+    #[arg(long, value_name = "FILE")]
+    scan_output: PathBuf,
+
+    /// File to stream JSON-lines probe results to
+    #[arg(long, value_name = "FILE")]
+    output: PathBuf,
+
+    /// Maximum number of probes in flight at once
+    #[arg(long, default_value_t = 100)]
+    concurrency: usize,
+
+    /// Per-probe timeout in seconds
+    #[arg(long, value_name = "SECS", default_value_t = 5.0)]
+    timeout: f64,
+
+    /// Which scheme(s) to probe with
+    #[arg(long, value_enum, default_value_t = Scheme::Auto)]
+    scheme: Scheme,
+
+    /// Accept invalid TLS certificates (only for your own self-signed hosts)
+    #[arg(long)]
+    insecure: bool,
+
+    /// Maximum HTTP redirects to follow per scheme attempt
+    #[arg(long, default_value_t = 5)]
+    max_redirects: usize,
+
+    /// Maximum response body bytes to read per scheme attempt
+    #[arg(long, value_name = "BYTES", default_value_t = 8192)]
+    body_cap: usize,
+}
+
 const CHANNEL_CAPACITY: usize = 1024;
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let cli = Cli::parse();
-    if let Err(err) = run(cli).await {
+    let result = match cli.command {
+        Commands::Scan(args) => run_scan(args).await,
+        Commands::Probe(args) => run_probe(args).await,
+    };
+    if let Err(err) = result {
         eprintln!("ftw: error: {err}");
         std::process::exit(1);
     }
 }
 
-async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+async fn run_scan(cli: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if !cli.timeout.is_finite() || cli.timeout <= 0.0 {
         return Err("timeout must be a positive number of seconds".into());
     }
@@ -76,6 +133,33 @@ async fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // `scan` returns after spawning every probe; each task holds a `tx`
     // clone, so the writer finishes only after all results are delivered.
     writer.await??;
+    Ok(())
+}
+
+async fn run_probe(cli: ProbeArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if !cli.timeout.is_finite() || cli.timeout <= 0.0 {
+        return Err("timeout must be a positive number of seconds".into());
+    }
+    let config = probe::ProbeConfig {
+        concurrency: cli.concurrency,
+        timeout: Duration::from_secs_f64(cli.timeout),
+        scheme: cli.scheme,
+        insecure: cli.insecure,
+        max_redirects: cli.max_redirects,
+        body_cap: cli.body_cap,
+    };
+    let stats = probe::run(&config, &cli.scan_output, cli.output).await?;
+    eprintln!(
+        "ftw: probed {} targets: {} http, {} tls errors, {} connect errors, {} timeouts, {} other errors; php detected on {}, not detected on {}",
+        stats.total,
+        stats.http,
+        stats.tls_errors,
+        stats.connect_errors,
+        stats.timeouts,
+        stats.other_errors,
+        stats.php_detected,
+        stats.php_not_detected,
+    );
     Ok(())
 }
 
