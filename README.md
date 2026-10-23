@@ -9,7 +9,7 @@
                        $$ |         $$ |   $$  /   \$$ |
                        \__|         \__|   \__/     \__|
                              >> FUCK TEH WORLD
-    Event-Driven Asynchronous Multi-Threaded TCP Port Scanner + HTTP Probe 
+          Event-Driven Asynchronous Multi-Threaded PHP2Shell Scanner
                                     v0.3.0
 ================================================================================
                      .o.                  .-"""-.
