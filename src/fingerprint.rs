@@ -330,9 +330,9 @@ fn looks_like_connect_error(text: &str) -> bool {
 }
 
 /// Classify a failed attempt. A TLS/certificate problem is always `tls_error`
-/// — never a closed port or a connect failure. Shared with the crawler so
-/// both subcommands report the same error kinds.
-pub(crate) fn classify_error(err: &reqwest::Error) -> &'static str {
+/// — never a closed port or a connect failure. Shared with the crawler and
+/// the prober so all subcommands report the same error kinds.
+pub fn classify_error(err: &reqwest::Error) -> &'static str {
     if err.is_timeout() {
         return "timeout";
     }

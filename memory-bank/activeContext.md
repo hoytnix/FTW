@@ -86,8 +86,26 @@ under `scan` subcommand).
     (<source>)` lines. No schema change, no other new flags. `cargo build`
     / clippy / `cargo test` 93/93 green (78 unit + 15 CLI). Committed,
     tagged `v0.2.3`, and pushed.
+15. Phase 2 fingerprinting probe (`ftw probe`) + authoritative on-host check
+    (`ftw host-check`) implemented and verified for authorized ranges only:
+    new `src/probe.rs` (port-fixed scheme, single GET / with 32 KiB cap,
+    cookie names only, X-Generator/Via/title/generator-meta/asset hints,
+    same-pass TLS CN/SAN/issuer/not-after via capture verifier + x509-parser,
+    favicon SHA-256, 16 KiB robots/sitemap presence+snippets, signal-count
+    confidence, remote-version-hint-only with `unknown_from_remote`), new
+    `src/host_check.rs` (YAML inventory refusing credential keys, SSH
+    BatchMode with existing config/agent only, verbatim `php -v` + package
+    query, fixture-tested parsers, JSONL summaries merged by host), plus
+    `probe_results`/`host_check_results` tables, single-writer streaming
+    writers, `[probe]`/`[host_check]` config sections, and 20 new tests
+    (loopback asserting every probe field incl. only-open-ports, host-check
+    fixtures with no live SSH, TLS-fields live test via the 443 shim).
+    `cargo build` clean, `cargo clippy --all-targets -- -D warnings` clean,
+    `cargo test` 113/113 green (97 unit + 16 CLI). Changes left uncommitted.
 
 ## Recent state changes
+- 2026-10-23: Phase 2 probe (`ftw probe`) + `ftw host-check` complete and
+  verified (build clean, clippy clean, 113/113 tests green). Left uncommitted.
 - 2026-10-23: added hacker-zine README.md + Kopimi LICENSE; banner swapped
   to user-supplied dollar-sign FTW art. Left uncommitted.
 - 2026-10-23: rebranded "Fuck The World" to "Fuck Teh World" (CLI about +

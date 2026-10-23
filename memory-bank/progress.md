@@ -6,7 +6,15 @@
 - `cargo build` clean, 0 warnings.
 - `cargo clippy --all-targets -- -D warnings` clean (system stable toolchain;
   clippy 0.1.99).
-- `cargo test` 93/93 green (78 unit + 15 CLI in `tests/live_output.rs`).
+- `cargo test` 113/113 green (97 unit + 16 CLI in `tests/live_output.rs`).
+  Adds: 7 probe unit tests (port-fixed scheme, cookie names, version-hint
+  order, confidence levels, full loopback field assertion, only-open-ports
+  pipeline, TLS-failure degradation, host-check merge), 7 host-check unit
+  tests (`php -v` Ubuntu/Remi/missing fixtures, dpkg+rpm parsing, marker
+  split, inventory shapes, credential refusal, JSONL load + bad-line error),
+  4 writer/verbose formatter tests, and the live `probe` TLS-fields test
+  (openssl s_server via the 443 shim asserting CN/issuer/not-after) plus
+  probe/host-check `--verbose`/`--quiet` conflict coverage.
   Scan/fingerprint detection, fetch-mode, tech, and verbose/quiet behavior
   unchanged; results moved from files to the master SQLite database, and the
   new `crawl` subcommand is covered (chain/cycle/external/depth, non-HTML,
@@ -30,7 +38,22 @@
   JSON text, `crawl_pages` upsert on normalized `url`, `crawl_links`
   `INSERT OR IGNORE`; `open_ports` / `crawl_seeds` (2xx–3xx only) seed
   queries; structural test proving only `db.rs` executes statements and only
-  the writer path owns a connection.
+  the writer path owns a connection. New tables `probe_results`
+  (`(host, port)` + full record JSON) and `host_check_results` (verbatim
+  `php -v` + package JSON); structural test extended to probe/host-check
+  workers.
+- `src/probe.rs` (new): `ftw probe` — seeds are open DB rows only; port-fixed
+  scheme (443 https, else http); one GET / pass per port (32 KiB cap) plus
+  favicon/robots/sitemap aux fetches; cookie names only; title/generator/
+  asset-hint parsing; same-pass TLS capture (capture-verifier + x509-parser
+  CN/SAN/issuer/not-after, https only); signal-count confidence; version
+  hints never patch evidence (`unknown_from_remote` unless a host-check
+  summary merges by host). No 404/OPTIONS/HEAD-diff/ETag probing.
+- `src/host_check.rs` (new): `ftw host-check` — YAML inventory (credential
+  keys refused), one SSH run per host (`BatchMode=yes`, existing config/agent
+  only, per-host timeout) running `php -v` + dpkg/rpm PHP package query;
+  verbatim raw outputs are the authoritative record; JSONL summaries feed
+  `ftw probe --host-check`.
 - `src/crawl.rs` (new): `ftw crawl` — coordinator-owned visited set +
   frontier, semaphore-gated workers (permit before spawn), GET-only fetches,
   redirect following with off-host stop, same-host scope (IP seeds also match

@@ -29,6 +29,8 @@ use tokio::sync::mpsc;
 use crate::crawl::{CrawlEvent, CrawlStats};
 use crate::db;
 use crate::fingerprint::{FingerprintRecord, FingerprintStats};
+use crate::host_check::{HostCheckRecord, HostCheckStats};
+use crate::probe::{ProbeRecord, ProbeStats};
 use crate::scanner::ScanResult;
 
 /// Live-output options shared by all subcommands.
@@ -169,6 +171,58 @@ pub fn format_fingerprint_verbose(elapsed: Duration, record: &FingerprintRecord)
     line
 }
 
+/// One verbose stderr line per probe event: `host:port`, the scheme fixed
+/// by port, HTTP status (or error), final URL, Server header, stack hint
+/// with confidence, and patch status. The JSON record on stdout stays the
+/// machine-readable source of truth.
+#[must_use]
+pub fn format_probe_verbose(elapsed: Duration, record: &ProbeRecord) -> String {
+    let outcome = match record.status {
+        Some(status) => status.to_string(),
+        None => format!(
+            "error:{}",
+            record.error.as_deref().unwrap_or("other")
+        ),
+    };
+    let mut line = format!(
+        "[+{:.2}s] {}:{} via {} -> {} {}",
+        elapsed.as_secs_f64(),
+        record.host,
+        record.port,
+        record.scheme,
+        outcome,
+        record.final_url,
+    );
+    if let Some(server) = record.server.as_deref().filter(|s| !s.is_empty()) {
+        line.push_str(&format!(" server=\"{server}\""));
+    }
+    if let Some(stack) = record.stack_hint.as_deref() {
+        line.push_str(&format!(" stack={stack}({})", record.confidence));
+    }
+    line.push_str(&format!(" patch={}", record.patch_status));
+    line.push('\n');
+    line
+}
+
+/// One verbose stderr line per host-check event: host, PHP version (or its
+/// absence), package count, or the SSH error. Verbatim output stays in the
+/// JSON record on stdout.
+#[must_use]
+pub fn format_host_check_verbose(elapsed: Duration, record: &HostCheckRecord) -> String {
+    let outcome = match record.error.as_deref() {
+        Some(err) => format!("error:{err}"),
+        None => match record.php_version.as_deref() {
+            Some(version) => format!("php={version} ({} packages)", record.packages.len()),
+            None => "php=absent".to_string(),
+        },
+    };
+    format!(
+        "[+{:.2}s] {} {outcome}\n",
+        elapsed.as_secs_f64(),
+        record.host,
+    )
+}
+
 /// One stdout line per crawled page: `<url> <status-or-error>`.
 #[must_use]
 pub fn format_crawl_page(url: &str, status: Option<u16>, error: Option<&str>) -> String {
@@ -266,6 +320,70 @@ pub async fn run_fingerprint_db_writer(
         }
         if options.verbose {
             eprint!("{}", format_fingerprint_verbose(start.elapsed(), &record));
+        }
+        if !options.quiet {
+            io::stdout().flush()?;
+        }
+    }
+    db::checkpoint(&conn);
+    Ok(stats)
+}
+
+/// Drain probe records: upsert each record into the master database as
+/// well as duplicating it to stdout as one JSON object per line (unless
+/// quiet), with a verbose stderr line per event when requested. Flushes
+/// stdout after every event. Ends when all senders drop, then checkpoints
+/// WAL. The whole run is never buffered: each record streams out on arrival.
+pub async fn run_probe_db_writer(
+    mut rx: mpsc::Receiver<ProbeRecord>,
+    conn: Connection,
+    options: OutputOptions,
+) -> io::Result<ProbeStats> {
+    let start = Instant::now();
+    let mut stats = ProbeStats::default();
+    while let Some(record) = rx.recv().await {
+        stats.record(&record);
+        db::upsert_probe(&conn, &record).map_err(db_error)?;
+        let mut line =
+            serde_json::to_string(&record).map_err(|err| io::Error::other(err.to_string()))?;
+        line.push('\n');
+        if !options.quiet {
+            emit_stdout(&line);
+        }
+        if options.verbose {
+            eprint!("{}", format_probe_verbose(start.elapsed(), &record));
+        }
+        if !options.quiet {
+            io::stdout().flush()?;
+        }
+    }
+    db::checkpoint(&conn);
+    Ok(stats)
+}
+
+/// Drain host-check records: upsert each record into the master database as
+/// well as duplicating it to stdout as one JSON object per line (unless
+/// quiet), with a verbose stderr line per event when requested. Flushes
+/// stdout after every event. Ends when all senders drop, then checkpoints
+/// WAL. The whole run is never buffered: each record streams out on arrival.
+pub async fn run_host_check_db_writer(
+    mut rx: mpsc::Receiver<HostCheckRecord>,
+    conn: Connection,
+    options: OutputOptions,
+) -> io::Result<HostCheckStats> {
+    let start = Instant::now();
+    let mut stats = HostCheckStats::default();
+    while let Some(record) = rx.recv().await {
+        stats.record(&record);
+        db::upsert_host_check(&conn, &record).map_err(db_error)?;
+        let mut line =
+            serde_json::to_string(&record).map_err(|err| io::Error::other(err.to_string()))?;
+        line.push('\n');
+        if !options.quiet {
+            emit_stdout(&line);
+        }
+        if options.verbose {
+            eprint!("{}", format_host_check_verbose(start.elapsed(), &record));
         }
         if !options.quiet {
             io::stdout().flush()?;
@@ -425,6 +543,118 @@ mod tests {
         std::fs::remove_file(&path).ok();
     }
 
+    fn probe_record(port: u16) -> ProbeRecord {
+        ProbeRecord {
+            host: "127.0.0.1".to_string(),
+            port,
+            scheme: "http".to_string(),
+            final_url: format!("http://127.0.0.1:{port}/"),
+            status: Some(200),
+            server: Some("TestServer/1.0".to_string()),
+            cookie_names: vec!["PHPSESSID".to_string()],
+            x_generator: None,
+            via: None,
+            generator: None,
+            title: None,
+            asset_hints: Vec::new(),
+            tls_cn: None,
+            tls_san: Vec::new(),
+            tls_issuer: None,
+            tls_not_after: None,
+            favicon_sha256: None,
+            robots_present: false,
+            robots_status: None,
+            robots_snippet: String::new(),
+            robots_truncated: false,
+            sitemap_present: false,
+            sitemap_status: None,
+            sitemap_snippet: String::new(),
+            sitemap_truncated: false,
+            confidence: "low".to_string(),
+            confidence_signals: vec!["cookies".to_string()],
+            stack_hint: Some("php".to_string()),
+            remote_version_hint: None,
+            patch_status: crate::probe::PATCH_UNKNOWN_FROM_REMOTE.to_string(),
+            host_check: None,
+            error: None,
+        }
+    }
+
+    fn host_check_record(host: &str) -> HostCheckRecord {
+        HostCheckRecord {
+            host: host.to_string(),
+            php_raw: "PHP 8.2.10 (cli)".to_string(),
+            php_version: Some("8.2.10".to_string()),
+            packages_raw: "php8.2-cli 8.2.10".to_string(),
+            packages: vec![crate::host_check::PhpPackage {
+                name: "php8.2-cli".to_string(),
+                version: "8.2.10".to_string(),
+            }],
+            error: None,
+        }
+    }
+
+    /// The probe writer persists every record to the database (no result
+    /// files): two events, one per open port, rerun upserting in place.
+    #[tokio::test]
+    async fn probe_writer_persists_records_to_database() {
+        let path = temp_db("probe");
+        let conn = db::open(&path).expect("open db");
+        let (tx, rx) = mpsc::channel(8);
+        let options = OutputOptions::new(false, true);
+        let task = tokio::spawn(run_probe_db_writer(rx, conn, options));
+        for port in [8080u16, 8081] {
+            tx.send(probe_record(port)).await.expect("send record");
+        }
+        drop(tx);
+        let stats = task.await.expect("writer task").expect("writer ok");
+        assert_eq!(stats.total, 2);
+
+        let check = db::open(&path).expect("reopen db");
+        let count: i64 = check
+            .query_row("SELECT COUNT(*) FROM probe_results", [], |row| row.get(0))
+            .expect("count rows");
+        assert_eq!(count, 2, "every record must land in the database");
+        let patch: String = check
+            .query_row(
+                "SELECT patch_status FROM probe_results WHERE port = 8080",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read patch status");
+        assert_eq!(patch, crate::probe::PATCH_UNKNOWN_FROM_REMOTE);
+        std::fs::remove_file(&path).ok();
+    }
+
+    /// The host-check writer persists every record to the database with the
+    /// verbatim `php -v` output intact.
+    #[tokio::test]
+    async fn host_check_writer_persists_records_to_database() {
+        let path = temp_db("host-check");
+        let conn = db::open(&path).expect("open db");
+        let (tx, rx) = mpsc::channel(8);
+        let options = OutputOptions::new(false, true);
+        let task = tokio::spawn(run_host_check_db_writer(rx, conn, options));
+        tx.send(host_check_record("web1.example.com"))
+            .await
+            .expect("send record");
+        drop(tx);
+        let stats = task.await.expect("writer task").expect("writer ok");
+        assert_eq!(stats.total, 1);
+        assert_eq!(stats.with_php, 1);
+
+        let check = db::open(&path).expect("reopen db");
+        let raw: String = check
+            .query_row(
+                "SELECT php_raw FROM host_check_results WHERE host = 'web1.example.com'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("read php raw");
+        assert!(raw.contains("PHP 8.2.10"), "verbatim output kept: {raw}");
+        std::fs::remove_file(&path).ok();
+    }
+
     #[test]
     fn scan_verbose_names_filtered_reason_not_just_filtered() {
         use std::net::IpAddr;
@@ -438,6 +668,26 @@ mod tests {
         assert!(line.contains("127.0.0.1:9"), "line names the target: {line}");
         assert!(line.contains("filtered"), "line names the status: {line}");
         assert!(line.contains("timeout"), "line names the reason: {line}");
+    }
+
+    #[test]
+    fn probe_verbose_names_host_scheme_stack_and_patch() {
+        let mut record = probe_record(8080);
+        record.stack_hint = Some("wordpress".to_string());
+        record.confidence = "high".to_string();
+        let line = format_probe_verbose(Duration::from_millis(50), &record);
+        assert!(line.contains("127.0.0.1:8080"), "names target: {line}");
+        assert!(line.contains("http"), "names scheme: {line}");
+        assert!(line.contains("wordpress(high)"), "names stack+confidence: {line}");
+        assert!(line.contains("unknown_from_remote"), "names patch status: {line}");
+    }
+
+    #[test]
+    fn host_check_verbose_names_host_and_php() {
+        let record = host_check_record("web1.example.com");
+        let line = format_host_check_verbose(Duration::from_millis(50), &record);
+        assert!(line.contains("web1.example.com"), "names host: {line}");
+        assert!(line.contains("php=8.2.10"), "names php version: {line}");
     }
 
     #[test]

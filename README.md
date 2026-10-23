@@ -10,7 +10,7 @@
                        \__|         \__|   \__/     \__|
                              >> FUCK TEH WORLD
     Event-Driven Asynchronous Multi-Threaded TCP Port Scanner + HTTP Probe 
-                                    v0.2.3
+                                    v0.2.4
 ================================================================================
                      .o.                  .-"""-.
                     /o o\                / .--. \

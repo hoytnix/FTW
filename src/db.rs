@@ -76,6 +76,25 @@ CREATE TABLE IF NOT EXISTS crawl_links (
   to_url   TEXT NOT NULL,
   PRIMARY KEY (from_url, to_url)
 );
+CREATE TABLE IF NOT EXISTS probe_results (
+  host          TEXT NOT NULL,
+  port          INTEGER NOT NULL,
+  scheme        TEXT NOT NULL,
+  final_url     TEXT NOT NULL,
+  status        INTEGER,
+  server        TEXT,
+  patch_status  TEXT NOT NULL,
+  record_json   TEXT NOT NULL,
+  probed_at     TEXT NOT NULL,
+  PRIMARY KEY (host, port)
+);
+CREATE TABLE IF NOT EXISTS host_check_results (
+  host          TEXT PRIMARY KEY,
+  php_version   TEXT,
+  php_raw       TEXT NOT NULL,
+  packages_json TEXT NOT NULL,
+  checked_at    TEXT NOT NULL
+);
 ";
 
 /// Open (or create) the master database, configure WAL mode, a 5 s busy
@@ -292,6 +311,66 @@ pub fn upsert_crawl_page(
     Ok(())
 }
 
+/// Insert or update one probe record, keyed by `(host, port)`. The full
+/// record travels as JSON text; the column subset keeps seed-style queries
+/// possible without parsing JSON.
+pub fn upsert_probe(
+    conn: &Connection,
+    record: &crate::probe::ProbeRecord,
+) -> Result<(), rusqlite::Error> {
+    let json = serde_json::to_string(record).unwrap_or_else(|_| "{}".to_string());
+    conn.execute(
+        "INSERT INTO probe_results
+         (host, port, scheme, final_url, status, server, patch_status,
+          record_json, probed_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT (host, port) DO UPDATE SET
+           scheme = excluded.scheme, final_url = excluded.final_url,
+           status = excluded.status, server = excluded.server,
+           patch_status = excluded.patch_status,
+           record_json = excluded.record_json,
+           probed_at = excluded.probed_at",
+        params![
+            record.host,
+            record.port,
+            record.scheme,
+            record.final_url,
+            record.status,
+            record.server,
+            record.patch_status,
+            json,
+            now_iso8601(),
+        ],
+    )?;
+    Ok(())
+}
+
+/// Insert or update one host-check record, keyed by host. The verbatim
+/// `php -v` output is stored in full; packages travel as JSON text.
+pub fn upsert_host_check(
+    conn: &Connection,
+    record: &crate::host_check::HostCheckRecord,
+) -> Result<(), rusqlite::Error> {
+    let json = serde_json::to_string(&record.packages).unwrap_or_else(|_| "[]".to_string());
+    conn.execute(
+        "INSERT INTO host_check_results
+         (host, php_version, php_raw, packages_json, checked_at)
+         VALUES (?1, ?2, ?3, ?4, ?5)
+         ON CONFLICT (host) DO UPDATE SET
+           php_version = excluded.php_version, php_raw = excluded.php_raw,
+           packages_json = excluded.packages_json,
+           checked_at = excluded.checked_at",
+        params![
+            record.host,
+            record.php_version,
+            record.php_raw,
+            json,
+            now_iso8601(),
+        ],
+    )?;
+    Ok(())
+}
+
 /// Record one extracted link, including external links that are never
 /// fetched. Repeats are ignored, so cycles cannot duplicate rows.
 pub fn insert_crawl_link(
@@ -336,7 +415,14 @@ mod tests {
     fn open_creates_all_tables_and_indexes() {
         let path = temp_db("schema");
         let conn = open(&path).expect("open db");
-        for table in ["scan_results", "fingerprint_results", "crawl_pages", "crawl_links"] {
+        for table in [
+            "scan_results",
+            "fingerprint_results",
+            "crawl_pages",
+            "crawl_links",
+            "probe_results",
+            "host_check_results",
+        ] {
             let count: i64 = conn
                 .query_row(
                     "SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?1",
@@ -493,29 +579,33 @@ mod tests {
     /// Structural proof of the single-writer design, scoped to production
     /// code (test modules below `#[cfg(test)]` may open read connections to
     /// assert on): the only module that executes SQL statements is `db.rs`
-    /// itself. Scanner, fingerprint, and crawl workers never touch rusqlite
-    /// at all, and the writer (`output.rs`) only calls `db::upsert_*` /
-    /// `insert_*` helpers over the one connection it owns — it never
-    /// executes statements directly.
+    /// itself. Scanner, fingerprint, crawl, probe, and host-check workers
+    /// never touch rusqlite at all, and the writer (`output.rs`) only calls
+    /// `db::upsert_*` / `insert_*` helpers over the one connection it owns —
+    /// it never executes statements directly.
     #[test]
     fn only_the_single_writer_path_executes_database_writes() {
         fn production(source: &str) -> &str {
             source.split("#[cfg(test)]").next().unwrap_or(source)
         }
-        for worker in ["scanner.rs", "crawl.rs", "fingerprint.rs"] {
-            let source = match worker {
-                "scanner.rs" => production(include_str!("scanner.rs")),
-                "crawl.rs" => production(include_str!("crawl.rs")),
-                _ => production(include_str!("fingerprint.rs")),
-            };
+        for worker in [
+            ("scanner.rs", production(include_str!("scanner.rs"))),
+            ("crawl.rs", production(include_str!("crawl.rs"))),
+            ("fingerprint.rs", production(include_str!("fingerprint.rs"))),
+            ("probe.rs", production(include_str!("probe.rs"))),
+            ("host_check.rs", production(include_str!("host_check.rs"))),
+        ] {
             assert!(
-                !source.contains("rusqlite"),
-                "{worker} must never open a database connection or write directly"
+                !worker.1.contains("rusqlite"),
+                "{} must never open a database connection or write directly",
+                worker.0
             );
         }
         for module in [
             ("output.rs", production(include_str!("output.rs"))),
             ("fingerprint.rs", production(include_str!("fingerprint.rs"))),
+            ("probe.rs", production(include_str!("probe.rs"))),
+            ("host_check.rs", production(include_str!("host_check.rs"))),
         ] {
             assert!(
                 !module.1.contains(".execute"),

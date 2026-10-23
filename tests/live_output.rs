@@ -447,7 +447,7 @@ fn fingerprint_quiet_suppresses_stdout_but_writes_db() {
     remove_db(&db_path);
 }
 
-/// `--verbose` and `--quiet` together are rejected by clap for all three
+/// `--verbose` and `--quiet` together are rejected by clap for all five
 /// subcommands.
 #[test]
 fn verbose_and_quiet_conflict_on_all_subcommands() {
@@ -503,6 +503,38 @@ fn verbose_and_quiet_conflict_on_all_subcommands() {
     assert!(
         !crawl.status.success(),
         "--verbose + --quiet must be rejected for crawl"
+    );
+
+    let probe = Command::new(ftw_bin())
+        .args([
+            "probe",
+            "--db",
+            &db_path.to_string_lossy(),
+            "--verbose",
+            "--quiet",
+        ])
+        .output()
+        .expect("run conflicting probe");
+    assert!(
+        !probe.status.success(),
+        "--verbose + --quiet must be rejected for probe"
+    );
+
+    let host_check = Command::new(ftw_bin())
+        .args([
+            "host-check",
+            "--inventory",
+            "/nonexistent-inventory.yml",
+            "--db",
+            &db_path.to_string_lossy(),
+            "--verbose",
+            "--quiet",
+        ])
+        .output()
+        .expect("run conflicting host-check");
+    assert!(
+        !host_check.status.success(),
+        "--verbose + --quiet must be rejected for host-check"
     );
 
     std::fs::remove_file(&yaml_path).ok();
@@ -1267,6 +1299,189 @@ fn fingerprint_prefer_https_happy_path_fingerprints_only_443() {
             "SELECT port || ' ' || status FROM scan_results WHERE ip = '127.0.0.1' ORDER BY port"
         ),
         vec!["80 open".to_string(), "443 open".to_string()]
+    );
+
+    std::fs::remove_file(&shim).ok();
+    std::fs::remove_file(&key).ok();
+    std::fs::remove_file(&cert).ok();
+    remove_db(&db_path);
+}
+
+/// `ftw probe` against a live TLS fixture on port 443 (via the same
+/// LD_PRELOAD shim): the HTTPS pass records status 200 plus the peer
+/// certificate CN/issuer/not-after captured in the same pass — no separate
+/// TLS-only probe, no plaintext HTTP to 443.
+#[test]
+fn probe_https_records_tls_fields_from_same_pass() {
+    let tag = temp_tag("probe-tls");
+    let dir = std::env::temp_dir();
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let shim_src = manifest.join("tests").join("shim_443.c");
+    let shim = dir.join(format!("{tag}-shim.so"));
+    let key = dir.join(format!("{tag}-key.pem"));
+    let cert = dir.join(format!("{tag}-cert.pem"));
+    let db_path = temp_path(&tag, "db");
+    let shim_text = shim.to_string_lossy().into_owned();
+
+    let shadow = {
+        let sock = std::net::TcpListener::bind("127.0.0.1:0").expect("bind temp port");
+        sock.local_addr().expect("temp addr").port()
+    };
+    let shadow_text = shadow.to_string();
+
+    let cc = Command::new("cc")
+        .args([
+            "-shared",
+            "-fPIC",
+            "-O2",
+            "-o",
+            shim_text.as_str(),
+            shim_src.to_string_lossy().as_ref(),
+            "-ldl",
+        ])
+        .output()
+        .expect("build port-443 shim (needs cc)");
+    assert!(
+        cc.status.success(),
+        "cc must build the shim: {}",
+        String::from_utf8_lossy(&cc.stderr)
+    );
+
+    let mint = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            &key.to_string_lossy(),
+            "-out",
+            &cert.to_string_lossy(),
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=127.0.0.1",
+        ])
+        .output()
+        .expect("mint test certificate");
+    assert!(
+        mint.status.success(),
+        "openssl must mint the test certificate: {}",
+        String::from_utf8_lossy(&mint.stderr)
+    );
+
+    seed_open_ports(&db_path, &[443]);
+
+    let mut server = Command::new("openssl")
+        .env("LD_PRELOAD", &shim_text)
+        .env("FTW_SHADOW_PORT", &shadow_text)
+        .args([
+            "s_server",
+            "-accept",
+            "443",
+            "-cert",
+            &cert.to_string_lossy(),
+            "-key",
+            &key.to_string_lossy(),
+            "-www",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("start s_server");
+
+    let mut ready = false;
+    for _ in 0..200 {
+        let probe = Command::new("curl")
+            .env("LD_PRELOAD", &shim_text)
+            .env("FTW_SHADOW_PORT", &shadow_text)
+            .args([
+                "-sk",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "https://127.0.0.1:443/",
+            ])
+            .output();
+        if let Ok(probe) = probe {
+            if probe.status.success()
+                && String::from_utf8_lossy(&probe.stdout).trim() == "200"
+            {
+                ready = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if !ready {
+        let _ = server.kill();
+        let _ = server.wait();
+        panic!("s_server never came up on shadow port {shadow}");
+    }
+
+    let output = Command::new(ftw_bin())
+        .env("LD_PRELOAD", &shim_text)
+        .env("FTW_SHADOW_PORT", &shadow_text)
+        .args([
+            "probe",
+            "--db",
+            &db_path.to_string_lossy(),
+            "--verbose",
+            "--insecure",
+        ])
+        .output()
+        .expect("run ftw probe");
+    let _ = server.kill();
+    let _ = server.wait();
+    assert!(
+        output.status.success(),
+        "probe failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "stdout carries one live JSON line for the single probed port"
+    );
+    let record: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout line is JSON");
+    assert_eq!(record["host"], "127.0.0.1");
+    assert_eq!(record["port"], 443);
+    assert_eq!(record["scheme"], "https");
+    assert_eq!(record["status"], 200);
+    assert_eq!(record["tls_cn"], "127.0.0.1");
+    assert!(
+        record["tls_issuer"].as_str().is_some_and(|s| s.contains("127.0.0.1")),
+        "issuer names the test CN: {}",
+        record["tls_issuer"]
+    );
+    assert!(
+        record["tls_not_after"].as_str().is_some_and(|s| !s.is_empty()),
+        "not-after is recorded"
+    );
+    assert_eq!(record["patch_status"], "unknown_from_remote");
+    assert!(
+        record["confidence"].as_str().is_some(),
+        "confidence is always present"
+    );
+
+    assert_eq!(
+        db_text_rows(&db_path, "SELECT scheme FROM probe_results"),
+        vec!["https".to_string()]
+    );
+    assert_eq!(
+        db_text_rows(&db_path, "SELECT patch_status FROM probe_results"),
+        vec!["unknown_from_remote".to_string()]
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(
+        stderr.contains("probed"),
+        "summary reports the probe run: {stderr}"
     );
 
     std::fs::remove_file(&shim).ok();

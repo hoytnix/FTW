@@ -2,7 +2,9 @@ mod config;
 mod crawl;
 mod db;
 mod fingerprint;
+mod host_check;
 mod output;
+mod probe;
 mod rate_limit;
 mod scanner;
 mod targets;
@@ -37,6 +39,13 @@ enum Commands {
     Fingerprint(FingerprintArgs),
     /// Crawl seed pages from the master database (same-host only).
     Crawl(CrawlArgs),
+    /// Probe open ports from the master database with a single GET / plus
+    /// favicon, robots.txt, and sitemap.xml fetches (authorized ranges only).
+    Probe(ProbeArgs),
+    /// Check on-host PHP patch state over SSH using your existing SSH
+    /// config and agent only (authorized ranges only; never stores
+    /// credentials).
+    HostCheck(HostCheckArgs),
 }
 
 /// Phase 1 scan flags. Results live in the master database (`--db`); there
@@ -208,6 +217,88 @@ struct CrawlArgs {
     quiet: bool,
 }
 
+/// Probe flags. Seeds are open ports from the master database (`--db`),
+/// read as Phase 1 output; closed and filtered ports are never re-probed.
+/// One JSONL record per open port streams to stdout as it arrives.
+#[derive(Debug, Args)]
+struct ProbeArgs {
+    /// Maximum number of probes in flight at once (default 100)
+    #[arg(long)]
+    concurrency: Option<usize>,
+
+    /// Per-request timeout in seconds (default 2)
+    #[arg(long, value_name = "SECS")]
+    timeout: Option<f64>,
+
+    /// Accept invalid TLS certificates (only for your own self-signed hosts)
+    #[arg(long)]
+    insecure: bool,
+
+    /// Maximum response body bytes to read for GET / (default 32768)
+    #[arg(long, value_name = "BYTES")]
+    body_cap: Option<usize>,
+
+    /// Merge authoritative patch data from a `ftw host-check` JSONL file by
+    /// host (upgrades patch_status where a host matches)
+    #[arg(long, value_name = "FILE")]
+    host_check: Option<PathBuf>,
+
+    /// Master SQLite database file holding all scan/probe results
+    /// (default ftw.db)
+    #[arg(long, value_name = "FILE")]
+    db: Option<PathBuf>,
+
+    /// Config file with persistent defaults (discovery order when omitted:
+    /// ./ftw.toml, then $HOME/.config/ftw/config.toml)
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+
+    /// Print one human-readable stderr line per event (elapsed + detail)
+    #[arg(short, long, conflicts_with = "quiet")]
+    verbose: bool,
+
+    /// Print nothing to the terminal during the run except errors and the
+    /// final summary to stderr (database still written, flushed per event)
+    #[arg(short, long, conflicts_with = "verbose")]
+    quiet: bool,
+}
+
+/// Host-check flags. Hosts come from the inventory file; checks run over
+/// SSH with BatchMode=yes using your existing SSH config and agent only.
+#[derive(Debug, Args)]
+struct HostCheckArgs {
+    /// Host inventory file (YAML: `{ hosts: [...] }` or a top-level
+    /// sequence of bare hostnames/IPs; credential keys are refused)
+    #[arg(long, value_name = "FILE")]
+    inventory: Option<PathBuf>,
+
+    /// Maximum number of SSH sessions in flight at once (default 16)
+    #[arg(long)]
+    concurrency: Option<usize>,
+
+    /// Per-host timeout in seconds (default 15)
+    #[arg(long, value_name = "SECS")]
+    timeout: Option<f64>,
+
+    /// Master SQLite database file holding all results (default ftw.db)
+    #[arg(long, value_name = "FILE")]
+    db: Option<PathBuf>,
+
+    /// Config file with persistent defaults (discovery order when omitted:
+    /// ./ftw.toml, then $HOME/.config/ftw/config.toml)
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+
+    /// Print one human-readable stderr line per event (elapsed + detail)
+    #[arg(short, long, conflicts_with = "quiet")]
+    verbose: bool,
+
+    /// Print nothing to the terminal during the run except errors and the
+    /// final summary to stderr (database still written, flushed per event)
+    #[arg(short, long, conflicts_with = "verbose")]
+    quiet: bool,
+}
+
 const CHANNEL_CAPACITY: usize = 1024;
 
 #[tokio::main(flavor = "multi_thread")]
@@ -217,6 +308,8 @@ async fn main() {
         Commands::Scan(args) => run_scan(args).await,
         Commands::Fingerprint(args) => run_fingerprint(args).await,
         Commands::Crawl(args) => run_crawl(args).await,
+        Commands::Probe(args) => run_probe(args).await,
+        Commands::HostCheck(args) => run_host_check(args).await,
     };
     if let Err(err) = result {
         eprintln!("ftw: error: {err}");
@@ -511,6 +604,130 @@ async fn run_crawl(cli: CrawlArgs) -> Result<(), Box<dyn std::error::Error + Sen
         "{}",
         crawl::format_summary(&stats, requests_per_minute)
     );
+    Ok(())
+}
+
+async fn run_probe(cli: ProbeArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let cfg_path = config::discover(cli.config.as_deref())?;
+    let file = match &cfg_path {
+        Some(path) => config::load(path)?,
+        None => config::FileConfig::default(),
+    };
+    let cfg = &file.probe;
+    let (concurrency, concurrency_src) = config::resolve(cli.concurrency, cfg.concurrency, 100);
+    let (timeout_secs, timeout_src) =
+        config::resolve(cli.timeout, cfg.timeout.map(|t| t.0), probe::DEFAULT_TIMEOUT_SECS);
+    let (insecure, insecure_src) = config::resolve_flag(cli.insecure, cfg.insecure, false);
+    let (body_cap, body_cap_src) =
+        config::resolve(cli.body_cap, cfg.body_cap, probe::DEFAULT_BODY_CAP);
+    let (host_check_path, host_check_src) = match (cli.host_check, cfg.host_check.clone()) {
+        (Some(value), _) => (Some(value), Source::Cli),
+        (None, Some(value)) => (Some(value), Source::Config),
+        (None, None) => (None, Source::Default),
+    };
+    let (db, db_src) = config::resolve(
+        cli.db,
+        file.global.db.clone(),
+        PathBuf::from("ftw.db"),
+    );
+    let (verbose, _) = config::resolve_flag(cli.verbose, cfg.verbose, false);
+    let (quiet, _) = config::resolve_flag(cli.quiet, cfg.quiet, false);
+    if verbose && quiet {
+        return Err("verbose and quiet conflict: enable only one".to_string().into());
+    }
+    let cfg_ref = cfg_path.as_deref();
+    config::require_at_least_one("probe", "concurrency", concurrency, concurrency_src, cfg_ref)?;
+    config::require_positive_seconds("probe", "timeout", timeout_secs, timeout_src, cfg_ref)?;
+    let timeout = check_timeout(timeout_secs)?;
+    if verbose {
+        eprintln!("{}", config::line("probe", "concurrency", &concurrency.to_string(), concurrency_src));
+        eprintln!("{}", config::line("probe", "timeout", &timeout_secs.to_string(), timeout_src));
+        eprintln!("{}", config::line("probe", "insecure", &insecure.to_string(), insecure_src));
+        eprintln!("{}", config::line("probe", "body_cap", &body_cap.to_string(), body_cap_src));
+        eprintln!("{}", config::line("probe", "host_check", &format!("{host_check_path:?}"), host_check_src));
+        let db_section = if db_src == Source::Config { "global" } else { "probe" };
+        eprintln!("{}", config::line(db_section, "db", &db.display().to_string(), db_src));
+    }
+    let host_checks = match &host_check_path {
+        Some(path) => host_check::summaries_from_jsonl(path)?,
+        None => std::collections::HashMap::new(),
+    };
+    if !host_checks.is_empty() {
+        eprintln!("ftw: merging host-check data for {} hosts", host_checks.len());
+    }
+    let probe_config = probe::ProbeConfig {
+        concurrency,
+        timeout,
+        insecure,
+        body_cap,
+    };
+    let options = output::OutputOptions::new(verbose, quiet);
+    let stats = probe::run_with_options(&probe_config, db, &host_checks, options).await?;
+    eprintln!("{}", probe::format_summary(&stats));
+    Ok(())
+}
+
+async fn run_host_check(
+    cli: HostCheckArgs,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let cfg_path = config::discover(cli.config.as_deref())?;
+    let file = match &cfg_path {
+        Some(path) => config::load(path)?,
+        None => config::FileConfig::default(),
+    };
+    let cfg = &file.host_check;
+    let (inventory_path, inventory_src) = match (cli.inventory, cfg.inventory.clone()) {
+        (Some(value), _) => (Some(value), Source::Cli),
+        (None, Some(value)) => (Some(value), Source::Config),
+        (None, None) => (None, Source::Default),
+    };
+    let Some(inventory_path) = inventory_path else {
+        return Err(
+            "no host inventory: pass --inventory <FILE> or set host_check.inventory in the config file"
+                .to_string()
+                .into(),
+        );
+    };
+    let (concurrency, concurrency_src) = config::resolve(cli.concurrency, cfg.concurrency, 16);
+    let (timeout_secs, timeout_src) = config::resolve(cli.timeout, cfg.timeout.map(|t| t.0), 15.0);
+    let (db, db_src) = config::resolve(
+        cli.db,
+        file.global.db.clone(),
+        PathBuf::from("ftw.db"),
+    );
+    let (verbose, _) = config::resolve_flag(cli.verbose, cfg.verbose, false);
+    let (quiet, _) = config::resolve_flag(cli.quiet, cfg.quiet, false);
+    if verbose && quiet {
+        return Err("verbose and quiet conflict: enable only one".to_string().into());
+    }
+    let cfg_ref = cfg_path.as_deref();
+    config::require_at_least_one(
+        "host-check",
+        "concurrency",
+        concurrency,
+        concurrency_src,
+        cfg_ref,
+    )?;
+    config::require_positive_seconds("host-check", "timeout", timeout_secs, timeout_src, cfg_ref)?;
+    let timeout = check_timeout(timeout_secs)?;
+    if verbose {
+        eprintln!("{}", config::line("host-check", "inventory", &inventory_path.display().to_string(), inventory_src));
+        eprintln!("{}", config::line("host-check", "concurrency", &concurrency.to_string(), concurrency_src));
+        eprintln!("{}", config::line("host-check", "timeout", &timeout_secs.to_string(), timeout_src));
+        let db_section = if db_src == Source::Config { "global" } else { "host-check" };
+        eprintln!("{}", config::line(db_section, "db", &db.display().to_string(), db_src));
+    }
+    let inventory = host_check::load_inventory(&inventory_path)?;
+    if inventory.is_empty() {
+        eprintln!("ftw: warning: no hosts to check");
+    }
+    let check_config = host_check::HostCheckConfig {
+        concurrency,
+        timeout,
+    };
+    let options = output::OutputOptions::new(verbose, quiet);
+    let stats = host_check::run_with_options(&check_config, inventory, db, options).await?;
+    eprintln!("{}", host_check::format_summary(&stats));
     Ok(())
 }
 

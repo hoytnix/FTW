@@ -168,11 +168,37 @@ pub struct CrawlSection {
 
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
+pub struct ProbeSection {
+    pub concurrency: Option<usize>,
+    pub timeout: Option<TimeoutSecs>,
+    pub insecure: Option<bool>,
+    pub body_cap: Option<usize>,
+    #[serde(alias = "host-check")]
+    pub host_check: Option<PathBuf>,
+    pub verbose: Option<bool>,
+    pub quiet: Option<bool>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
+pub struct HostCheckSection {
+    pub inventory: Option<PathBuf>,
+    pub concurrency: Option<usize>,
+    pub timeout: Option<TimeoutSecs>,
+    pub verbose: Option<bool>,
+    pub quiet: Option<bool>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
 pub struct FileConfig {
     pub global: GlobalSection,
     pub scan: ScanSection,
     pub fingerprint: FingerprintSection,
     pub crawl: CrawlSection,
+    pub probe: ProbeSection,
+    #[serde(alias = "host-check")]
+    pub host_check: HostCheckSection,
 }
 
 /// Known fields per section. `[crawl.rate_limits]` keys are canonical
@@ -203,6 +229,23 @@ fn section_fields(section: &str) -> &'static [&'static str] {
             "insecure",
             "requests_per_minute",
             "rate_limits",
+            "verbose",
+            "quiet",
+        ],
+        "probe" => &[
+            "concurrency",
+            "timeout",
+            "insecure",
+            "body_cap",
+            "host-check",
+            "host_check",
+            "verbose",
+            "quiet",
+        ],
+        "host-check" | "host_check" => &[
+            "inventory",
+            "concurrency",
+            "timeout",
             "verbose",
             "quiet",
         ],
