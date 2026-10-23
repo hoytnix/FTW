@@ -409,7 +409,7 @@ Greetz fly out to every sysadmin who ever left port 80 open on a Friday
 afternoon. You know who you are.
 
 This software is **KOPIMI**. Copy it, share it, remix it — copying is an act
-of love. See [LICENSE](/home/oloty/Dev/FTW/LICENSE).
+of love. See [LICENSE](https://github.com/hoytnix/FTW/blob/main/LICENSE).
 
 ```
 ================================================================================
