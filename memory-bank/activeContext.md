@@ -106,6 +106,8 @@ under `scan` subcommand).
 ## Recent state changes
 - 2026-10-23: Phase 2 probe (`ftw probe`) + `ftw host-check` complete and
   verified (build clean, clippy clean, 113/113 tests green). Left uncommitted.
+- 2026-10-23: bumped to v0.2.4 (Cargo.toml + README banner), committed
+  (`6a5df6a`), tagged `v0.2.4`, pushed commit + tag to origin. Tree clean.
 - 2026-10-23: added hacker-zine README.md + Kopimi LICENSE; banner swapped
   to user-supplied dollar-sign FTW art. Left uncommitted.
 - 2026-10-23: rebranded "Fuck The World" to "Fuck Teh World" (CLI about +
