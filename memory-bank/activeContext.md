@@ -108,6 +108,18 @@ under `scan` subcommand).
     streamed JSONL stdout line, the verbose line, and `crawl_pages`.
     Verified: build/clippy clean, 117/117 green (100 unit + 17 CLI),
     incl. new absolute-depth loopback test. Left uncommitted, not pushed.
+18. New `ftw cve-check` subcommand (offline PHP2Shell triage, no
+    probe/host-check/output changes): new `src/cve_check.rs` (`url_depth`-style
+    pure logic: `parse_php_token`, scope gate, `decide`, `priority_for`,
+    `assess`, `format_summary`; CVE rule as `CVE_RULES` data), CLI
+    `--probe/--fingerprint/--host-check/--output` (at least one input;
+    `--fingerprint` added because the gate's php_detected/wordpress/php_apps
+    signals only exist in fingerprint JSONL — probe JSONL lacks them).
+    Merging: host-check version > remote version; app versions never used;
+    backport proof = CVE id in host-check packages; SAPI authoritative from
+    host-check, inferred remotely. Verified: build/clippy clean, 131/131
+    green (113 unit incl. 13 cve-check fixture tests + 18 CLI incl. new
+    cve-check e2e). README 0x07 section added. Left uncommitted, not pushed.
 17. Phase 2 fingerprinting probe (`ftw probe`) + authoritative on-host check
     (`ftw host-check`) implemented and verified for authorized ranges only:
     new `src/probe.rs` (port-fixed scheme, single GET / with 32 KiB cap,

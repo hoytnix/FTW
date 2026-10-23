@@ -1,5 +1,6 @@
 mod config;
 mod crawl;
+mod cve_check;
 mod db;
 mod fingerprint;
 mod host_check;
@@ -46,6 +47,34 @@ enum Commands {
     /// config and agent only (authorized ranges only; never stores
     /// credentials).
     HostCheck(HostCheckArgs),
+    /// Assess PHP2Shell CVE exposure offline from existing probe,
+    /// fingerprint, and host-check JSONL files (authorized ranges only;
+    /// no requests, no exploits — version comparison only).
+    CveCheck(CveCheckArgs),
+}
+
+/// Offline CVE assessment flags. Inputs are existing JSONL files only.
+/// At least one of `--probe`, `--fingerprint`, or `--host-check` is
+/// required; records stream out as JSONL to stdout or `--output`.
+#[derive(Debug, Args)]
+struct CveCheckArgs {
+    /// Probe JSONL file (`ftw probe` stdout records)
+    #[arg(long, value_name = "FILE")]
+    probe: Option<PathBuf>,
+
+    /// Fingerprint JSONL file (`ftw fingerprint` stdout records: the only
+    /// source of `php_detected`, `wordpress_detected`, and `php_apps`)
+    #[arg(long, value_name = "FILE")]
+    fingerprint: Option<PathBuf>,
+
+    /// Host-check JSONL file (`ftw host-check` stdout records: authoritative
+    /// versions and vendor-backport proof)
+    #[arg(long, value_name = "FILE")]
+    host_check: Option<PathBuf>,
+
+    /// Write assessment JSONL here instead of stdout
+    #[arg(long, value_name = "FILE")]
+    output: Option<PathBuf>,
 }
 
 /// Phase 1 scan flags. Results live in the master database (`--db`); there
@@ -311,6 +340,7 @@ async fn main() {
         Commands::Crawl(args) => run_crawl(args).await,
         Commands::Probe(args) => run_probe(args).await,
         Commands::HostCheck(args) => run_host_check(args).await,
+        Commands::CveCheck(args) => run_cve_check(args),
     };
     if let Err(err) = result {
         eprintln!("ftw: error: {err}");
@@ -730,6 +760,78 @@ async fn run_host_check(
     let options = output::OutputOptions::new(verbose, quiet);
     let stats = host_check::run_with_options(&check_config, db, options).await?;
     eprintln!("{}", host_check::format_summary(&stats));
+    Ok(())
+}
+
+/// Read one JSONL input file into parsed values, warning on malformed
+/// lines (with file and line number) and skipping them.
+fn read_cve_jsonl(path: &PathBuf, values: &mut Vec<serde_json::Value>) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        match serde_json::from_str(line) {
+            Ok(value) => values.push(value),
+            Err(err) => eprintln!(
+                "ftw: warning: skipping invalid JSON on line {} of {}: {err}",
+                index + 1,
+                path.display()
+            ),
+        }
+    }
+    Ok(())
+}
+
+fn run_cve_check(cli: CveCheckArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if cli.probe.is_none() && cli.fingerprint.is_none() && cli.host_check.is_none() {
+        return Err(
+            "no input: pass at least one of --probe, --fingerprint, or --host-check".to_string().into(),
+        );
+    }
+    let mut values = Vec::new();
+    for path in [&cli.probe, &cli.fingerprint, &cli.host_check]
+        .into_iter()
+        .flatten()
+    {
+        read_cve_jsonl(path, &mut values)?;
+    }
+    if values.is_empty() {
+        eprintln!("ftw: warning: no assessment rows found in input files");
+    }
+    let (records, summary) = cve_check::assess(values);
+    match &cli.output {
+        Some(path) => {
+            let file = std::fs::File::create(path)
+                .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
+            let mut writer = std::io::BufWriter::new(file);
+            for record in &records {
+                let mut line = serde_json::to_string(record)
+                    .map_err(|err| format!("cannot encode assessment record: {err}"))?;
+                line.push('\n');
+                std::io::Write::write_all(&mut writer, line.as_bytes())
+                    .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
+            }
+            std::io::Write::flush(&mut writer)
+                .map_err(|err| format!("cannot write {}: {err}", path.display()))?;
+        }
+        None => {
+            let stdout = std::io::stdout();
+            let mut writer = std::io::BufWriter::new(stdout.lock());
+            for record in &records {
+                let mut line = serde_json::to_string(record)
+                    .map_err(|err| format!("cannot encode assessment record: {err}"))?;
+                line.push('\n');
+                std::io::Write::write_all(&mut writer, line.as_bytes())
+                    .map_err(|err| format!("cannot write stdout: {err}"))?;
+            }
+            std::io::Write::flush(&mut writer)
+                .map_err(|err| format!("cannot write stdout: {err}"))?;
+        }
+    }
+    eprintln!("{}", cve_check::format_summary(&summary));
     Ok(())
 }
 

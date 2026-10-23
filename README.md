@@ -10,7 +10,7 @@
                        \__|         \__|   \__/     \__|
                              >> FUCK TEH WORLD
     Event-Driven Asynchronous Multi-Threaded TCP Port Scanner + HTTP Probe 
-                                    v0.2.6
+                                    v0.3.0
 ================================================================================
                      .o.                  .-"""-.
                     /o o\                / .--. \
@@ -114,7 +114,7 @@ ftw scan --input targets.yml --ports 80,443 --db ftw.db
 | `--concurrency` | `500` | max probes in flight |
 | `--timeout` | `2` | seconds per connect probe |
 | `--db` | `ftw.db` | master database file |
-| `--config` | — | config file (see 0x07) |
+| `--config` | — | config file (see 0x08) |
 | `-v` / `--verbose` | off | one stderr line per event |
 | `-q` / `--quiet` | off | silent except errors + summary |
 
@@ -142,7 +142,7 @@ ftw fingerprint --db ftw.db --scheme auto --fetch-mode get
 | `--body-cap` | `8192` | max body bytes read per attempt |
 | `--fetch-mode` | `get` | `get` (one GET), `head` (headers only), `both` (HEAD then GET) |
 | `--no-prefer-https` | off | fingerprint 80 AND 443 instead of preferring 443 |
-| `--db` / `--config` | `ftw.db` | database file / config file (see 0x07) |
+| `--db` / `--config` | `ftw.db` | database file / config file (see 0x08) |
 
 Prefer-HTTPS: when one IP has both 80 and 443 open, only 443 is fingerprinted
 (HTTPS-only — never plaintext HTTP to 443), the 80 is skipped with no row,
@@ -185,7 +185,7 @@ ftw crawl --db ftw.db --max-depth 3 --requests-per-minute 60
 | `--max-redirects` | `5` | redirect limit per page |
 | `--insecure` | off | accept invalid certs (your own hosts only) |
 | `--requests-per-minute` | `0` | per-domain limit, `0` = unlimited |
-| `--db` / `--config` | `ftw.db` | database file / config file (see 0x07) |
+| `--db` / `--config` | `ftw.db` | database file / config file (see 0x08) |
 
 Rate limiting is per canonical domain (lowercased host, one `www.` stripped,
 scheme and port ignored) across ALL threads combined — never per-thread. A
@@ -238,7 +238,7 @@ ftw probe --db ftw.db --host-check host-check.jsonl
 | `--insecure` | off | accept invalid certs — your OWN self-signed hosts only |
 | `--body-cap` | `32768` | max `GET /` body bytes read |
 | `--host-check` | — | merge a `ftw host-check` JSONL file by host |
-| `--db` / `--config` | `ftw.db` | database file / config file (see 0x07) |
+| `--db` / `--config` | `ftw.db` | database file / config file (see 0x08) |
 
 # 0x06 // GROUND TRUTH: `ftw host-check`
 
@@ -274,9 +274,45 @@ Each record streams to stdout as one JSON object per line AND lands in
 |------|---------|---------|
 | `--concurrency` | `16` | max SSH sessions in flight |
 | `--timeout` | `15` | seconds per host |
-| `--db` / `--config` | `ftw.db` | database file / config file (see 0x07) |
+| `--db` / `--config` | `ftw.db` | database file / config file (see 0x08) |
 
-# 0x07 // CONFIG FILE: STOP RETYPING FLAGS
+# 0x07 // TRIAGE: `ftw cve-check`
+
+Offline PHP2Shell assessment (CVE-2026-109618, CVE-2026-109619,
+unauthenticated RCE in PHP itself) on top of existing output. Reads `ftw
+fingerprint` and/or `ftw probe` JSONL plus optional `ftw host-check` JSONL —
+no requests, no exploits, version comparison only. Only hosts verified to
+run PHP are checked (host-check version, `X-Powered-By` with PHP, `Server`
+with PHP, `PHPSESSID` cookie, `php_detected`, WordPress, or a PHP app);
+everything else is `not_applicable`, never vulnerable or unknown. Fixed:
+8.2.35, 8.3.36, 8.4.27, 8.5.12. 8.1 and older have no official release, so
+they stay vulnerable unless a CVE id in the host-check package list proves
+a vendor backport. WordPress/app versions are never used as the PHP version.
+
+```sh
+ftw fingerprint --scheme auto > fp.jsonl
+ftw probe > probe.jsonl
+ftw host-check > host-check.jsonl
+ftw cve-check --probe probe.jsonl --fingerprint fp.jsonl --host-check host-check.jsonl --output cve.jsonl
+```
+
+One JSON object per host on stdout (or `--output`): `host`, `ip`,
+`verified_php`, `verification_source`, `version_source`, `version_raw`,
+`version_parsed`, `distro_suffix`, `backport_check_needed`, `sapi`,
+`sapi_source`, `cve_ids`, `verdict` (`vulnerable` / `patched` /
+`unknown_assume_vulnerable` / `not_applicable`), `confidence`, `priority`
+(1 = vulnerable on Apache/mod_php, patch these first), and a short `reason`.
+The stderr summary prints verdict counts plus checked vs not-applicable
+totals.
+
+| flag | default | meaning |
+|------|---------|---------|
+| `--probe` | — | probe JSONL file |
+| `--fingerprint` | — | fingerprint JSONL file (at least one input required) |
+| `--host-check` | — | host-check JSONL file (authoritative versions, backport proof) |
+| `--output` | stdout | write assessment JSONL here instead of stdout |
+
+# 0x08 // CONFIG FILE: STOP RETYPING FLAGS
 
 Any default can live in TOML. Discovery order: `--config <FILE>`, then
 `./ftw.toml`, then `$HOME/.config/ftw/config.toml`, then built-ins.
@@ -338,7 +374,7 @@ config: crawl.max_pages = 1000 (default)
 config: crawl.concurrency = 20 (cli)
 ```
 
-# 0x08 // FULL RUN, END TO END
+# 0x09 // FULL RUN, END TO END
 
 ```sh
 # 1. write targets.yml with YOUR ranges, then:
@@ -348,6 +384,9 @@ ftw crawl --max-depth 3 --requests-per-minute 60 --verbose
 # new tech, same db:
 ftw host-check > host-check.jsonl
 ftw probe --host-check host-check.jsonl --verbose
+# offline triage, no new requests:
+ftw fingerprint --scheme auto > fp.jsonl
+ftw cve-check --probe probe.jsonl --fingerprint fp.jsonl --host-check host-check.jsonl
 ```
 
 Or bake it all into `ftw.toml` once and just run the bare subcommands.
@@ -364,7 +403,7 @@ sqlite3 ftw.db "SELECT host, php_version FROM host_check_results;"
 `-q` silences everything but errors and the stderr summary; `-v` narrates
 every event plus the effective config. Stdout stays parseable either way.
 
-# 0x09 // GREETZ & LICENSE
+# 0x0A // GREETZ & LICENSE
 
 Greetz fly out to every sysadmin who ever left port 80 open on a Friday
 afternoon. You know who you are.

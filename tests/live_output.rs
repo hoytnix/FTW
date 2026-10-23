@@ -634,6 +634,87 @@ fn removed_file_flags_are_rejected() {
     remove_db(&db_path);
 }
 
+/// `ftw cve-check` on fixture JSONL files: host-check merges over probe
+/// rows, verdicts land in the output file, and the stderr summary carries
+/// verdict counts plus checked vs not-applicable totals.
+#[test]
+fn cve_check_assesses_fixture_jsonl_end_to_end() {
+    let tag = temp_tag("cvecheck");
+    let probe_path = temp_path(&tag, "probe.jsonl");
+    let hc_path = temp_path(&tag, "hc.jsonl");
+    let out_path = temp_path(&tag, "out.jsonl");
+    std::fs::write(
+        &probe_path,
+        concat!(
+            "{\"host\":\"10.2.0.1\",\"server\":\"Apache/2.4.58\",\"cookie_names\":[],\"remote_version_hint\":\"PHP/8.2.30\",\"confidence_signals\":[\"x-powered-by\"],\"stack_hint\":\"php\"}\n",
+            "{\"host\":\"10.2.0.2\",\"server\":\"nginx/1.24.0\",\"cookie_names\":[],\"remote_version_hint\":null,\"confidence_signals\":[],\"stack_hint\":\"wordpress\"}\n",
+            "{\"host\":\"10.2.0.3\",\"server\":\"nginx/1.24.0\",\"cookie_names\":[],\"remote_version_hint\":null,\"confidence_signals\":[],\"stack_hint\":null}\n",
+        ),
+    )
+    .expect("write probe fixture");
+    std::fs::write(
+        &hc_path,
+        "{\"host\":\"10.2.0.1\",\"php_raw\":\"PHP 8.2.10 (cli) (built: Aug 30 2024) ( NTS )\",\"php_version\":\"8.2.10\",\"packages_raw\":\"php8.2-cli 8.2.10-2ubuntu1\",\"packages\":[],\"error\":null}\n",
+    )
+    .expect("write host-check fixture");
+
+    let output = Command::new(ftw_bin())
+        .args([
+            "cve-check",
+            "--probe",
+            &probe_path.to_string_lossy(),
+            "--host-check",
+            &hc_path.to_string_lossy(),
+            "--output",
+            &out_path.to_string_lossy(),
+        ])
+        .output()
+        .expect("run ftw cve-check");
+    assert!(
+        output.status.success(),
+        "cve-check failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(
+        stderr.contains("assessed 3 hosts (checked 2, not applicable 1)"),
+        "summary totals: {stderr}"
+    );
+    assert!(stderr.contains("1 vulnerable"), "summary verdicts: {stderr}");
+
+    let text = std::fs::read_to_string(&out_path).expect("read output");
+    let mut verdicts = std::collections::HashMap::new();
+    for line in text.lines() {
+        let record: serde_json::Value = serde_json::from_str(line).expect("output is JSONL");
+        verdicts.insert(
+            record["host"].as_str().expect("host field").to_owned(),
+            record["verdict"].as_str().expect("verdict field").to_owned(),
+        );
+    }
+    assert_eq!(verdicts.get("10.2.0.1").map(String::as_str), Some("vulnerable"));
+    assert_eq!(
+        verdicts.get("10.2.0.2").map(String::as_str),
+        Some("unknown_assume_vulnerable")
+    );
+    assert_eq!(verdicts.get("10.2.0.3").map(String::as_str), Some("not_applicable"));
+
+    // No input files at all is a CLI error, not an empty run.
+    let output = Command::new(ftw_bin())
+        .args(["cve-check"])
+        .output()
+        .expect("run ftw cve-check without inputs");
+    assert!(!output.status.success(), "missing inputs must fail");
+    assert!(
+        String::from_utf8_lossy(&output.stderr).contains("no input"),
+        "error names the problem: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    std::fs::remove_file(&probe_path).ok();
+    std::fs::remove_file(&hc_path).ok();
+    std::fs::remove_file(&out_path).ok();
+}
+
 /// `--max-depth 0` and values below -1 are rejected as CLI errors; -1 and
 /// values >= 1 are accepted.
 #[test]

@@ -115,6 +115,13 @@
   followed nowhere, `depth` in every streamed JSONL line and the DB.
   Build/clippy clean, 117/117 tests green (100 unit + 17 CLI). Left
   uncommitted for review; not pushed.
+- WIP: new `ftw cve-check` subcommand (offline PHP2Shell assessment,
+  `src/cve_check.rs`, no probe/host-check changes). Scope gate, version
+  precedence (host-check > X-Powered-By > Server), CVE rule as data,
+  four verdicts, priority triage, JSONL via BufWriter, stderr summary.
+  Build/clippy clean, 131/131 green (113 unit + 18 CLI), README 0x07
+  section added (config/full-run/greetz renumbered). Left uncommitted
+  for review; not pushed.
 - Done 2026-10-23: README.md documents `ftw probe` + `ftw host-check`
   (behavior, flags, inventory rules, `[probe]`/`[host_check]` config, DB
   tables, full-run queries). Left uncommitted.
