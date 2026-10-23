@@ -37,7 +37,7 @@ use crate::{db, output, rate_limit};
 const CHANNEL_CAPACITY: usize = 1024;
 
 /// Runtime settings for a crawl run.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct CrawlConfig {
     pub concurrency: usize,
     pub timeout: Duration,
@@ -52,6 +52,9 @@ pub struct CrawlConfig {
     /// Sliding-window length for the rate limiter (60 seconds in
     /// production; tests pass shorter windows).
     pub rate_window: Duration,
+    /// Per-domain limits from `[crawl.rate_limits]`, replacing the global
+    /// default for those canonical domains only.
+    pub rate_overrides: std::collections::HashMap<String, u64>,
 }
 
 /// One crawled page. `url` is the normalized URL (dedupe key);
@@ -448,10 +451,10 @@ pub async fn run_with_options(
     }
     let client = build_client(config)?;
     eprintln!("ftw: crawling {} seed pages", seeds.len());
-    let limiter = Arc::new(rate_limit::RateLimiter::new(
-        config.requests_per_minute,
-        config.rate_window,
-    ));
+    let limiter = Arc::new(
+        rate_limit::RateLimiter::new(config.requests_per_minute, config.rate_window)
+            .with_overrides(config.rate_overrides.clone()),
+    );
     let verbose = options.verbose;
     let (db_tx, db_rx) = mpsc::channel::<CrawlEvent>(CHANNEL_CAPACITY);
     let writer =
@@ -495,7 +498,7 @@ pub async fn run_with_options(
             let db_tx = db_tx.clone();
             let coord_tx = coord_tx.clone();
             let client = client.clone();
-            let config = *config;
+            let config = config.clone();
             let limiter = limiter.clone();
             let semaphore = semaphore.clone();
             tokio::spawn(async move {
@@ -594,6 +597,7 @@ mod tests {
             insecure: false,
             requests_per_minute: 0,
             rate_window: Duration::from_secs(60),
+            rate_overrides: std::collections::HashMap::new(),
         }
     }
 
@@ -1304,6 +1308,101 @@ mod tests {
             arrivals_b[0] - start < Duration::from_millis(400),
             "the other domain proceeds without waiting: {:?}",
             arrivals_b[0] - start
+        );
+        remove_db(&db_path);
+    }
+
+    /// Per-domain overrides end to end: with a global 60/window and an
+    /// override of 5 for 127.0.0.1, six pages on 127.0.0.1 throttle (one
+    /// wait, one window-sized arrival gap) while six pages on 127.0.0.2 at
+    /// the global default flow without waiting.
+    #[tokio::test]
+    async fn crawl_per_domain_override_throttles_one_domain_only() {
+        let db_path = temp_db("override");
+        let (addr_a, stamps_a, server_a) = spawn_timestamp_server("127.0.0.1", |addr| {
+            let base = format!("http://{addr}");
+            let mut routes = HashMap::new();
+            routes.insert(
+                "/seed".to_string(),
+                html_page(
+                    "Seed",
+                    &[
+                        format!("{base}/a1"),
+                        format!("{base}/a2"),
+                        format!("{base}/a3"),
+                        format!("{base}/a4"),
+                        format!("{base}/a5"),
+                    ],
+                ),
+            );
+            for page in ["a1", "a2", "a3", "a4", "a5"] {
+                routes.insert(format!("/{page}"), html_page("A", &[]));
+            }
+            routes
+        })
+        .await;
+        let (addr_b, stamps_b, server_b) = spawn_timestamp_server("127.0.0.2", |addr| {
+            let base = format!("http://{addr}");
+            let mut routes = HashMap::new();
+            routes.insert(
+                "/seed".to_string(),
+                html_page(
+                    "Seed",
+                    &[
+                        format!("{base}/b1"),
+                        format!("{base}/b2"),
+                        format!("{base}/b3"),
+                        format!("{base}/b4"),
+                        format!("{base}/b5"),
+                    ],
+                ),
+            );
+            for page in ["b1", "b2", "b3", "b4", "b5"] {
+                routes.insert(format!("/{page}"), html_page("B", &[]));
+            }
+            routes
+        })
+        .await;
+        seed_fingerprint(&db_path, addr_a.port(), &format!("http://{addr_a}/seed"), 200);
+        seed_fingerprint(&db_path, addr_b.port(), &format!("http://{addr_b}/seed"), 200);
+        let config = CrawlConfig {
+            requests_per_minute: 60,
+            rate_window: Duration::from_millis(200),
+            rate_overrides: HashMap::from([("127.0.0.1".to_string(), 5)]),
+            ..test_config(2, 100)
+        };
+        let stats = run_with_options(&config, db_path.clone(), output::OutputOptions::default())
+            .await
+            .expect("crawl run");
+        server_a.abort();
+        server_b.abort();
+
+        assert_eq!(stats.visited, 12, "all seeds and children visited");
+        assert_eq!(
+            stats.rate_limit_waits, 1,
+            "exactly the sixth fetch on the overridden domain waited: {stats:?}"
+        );
+
+        let mut arrivals_a = stamps_a.lock().expect("stamp log").clone();
+        arrivals_a.sort_unstable();
+        assert_eq!(arrivals_a.len(), 6, "six fetches hit 127.0.0.1");
+        let gap = arrivals_a
+            .windows(2)
+            .map(|pair| pair[1] - pair[0])
+            .max()
+            .expect("arrival gaps");
+        assert!(
+            gap >= Duration::from_millis(150),
+            "the overridden domain shows a window-sized gap: {arrivals_a:?}"
+        );
+
+        let mut arrivals_b = stamps_b.lock().expect("stamp log").clone();
+        arrivals_b.sort_unstable();
+        assert_eq!(arrivals_b.len(), 6, "six fetches hit 127.0.0.2");
+        assert!(
+            arrivals_b[5] - arrivals_b[0] < Duration::from_millis(150),
+            "the default domain flows without waiting: {:?}",
+            arrivals_b[5] - arrivals_b[0]
         );
         remove_db(&db_path);
     }

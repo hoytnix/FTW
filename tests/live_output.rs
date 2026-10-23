@@ -807,6 +807,238 @@ fn fingerprint_no_prefer_https_fingerprints_both() {
     remove_db(&db_path);
 }
 
+/// Hermetic directory for config discovery tests: the child runs with its
+/// working directory and `$HOME` pointed here, so neither `./ftw.toml` nor
+/// `$HOME/.config/ftw/config.toml` can leak in from the real environment.
+fn config_dir(tag: &str) -> PathBuf {
+    let dir = std::env::temp_dir().join(tag);
+    std::fs::create_dir_all(&dir).expect("config test dir");
+    dir
+}
+
+fn write_config(dir: &std::path::Path, name: &str, body: &str) -> PathBuf {
+    let path = dir.join(name);
+    std::fs::write(&path, body).expect("write config");
+    path
+}
+
+/// Config precedence end to end on empty databases (no seeds, so runs are
+/// instant): config-only shows `(config)` values and the config summary,
+/// CLI overrides show `(cli)`, and no config shows `(default)` + unlimited.
+/// A config setting only some options leaves the rest at built-in defaults.
+#[test]
+fn crawl_config_precedence_cli_over_config_over_default() {
+    let tag = temp_tag("cfg-precedence");
+    let dir = config_dir(&tag);
+    let db_path = dir.join("t.db");
+    let cfg_path = write_config(
+        &dir,
+        "ftw.toml",
+        "[crawl]\nrequests_per_minute = 5\nmax_pages = 7\ntimeout = 9\n",
+    );
+
+    // Config only: values and summary come from the file; untouched options
+    // stay at built-in defaults instead of resetting to zero.
+    let output = Command::new(ftw_bin())
+        .current_dir(&dir)
+        .env("HOME", &dir)
+        .args([
+            "crawl",
+            "--db",
+            &db_path.to_string_lossy(),
+            "--config",
+            &cfg_path.to_string_lossy(),
+            "--verbose",
+        ])
+        .output()
+        .expect("run ftw crawl with config");
+    assert!(
+        output.status.success(),
+        "config-only crawl failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(
+        stderr.contains("config: crawl.requests_per_minute = 5 (config)"),
+        "config value with source: {stderr}"
+    );
+    assert!(
+        stderr.contains("config: crawl.max_pages = 7 (config)"),
+        "second config value: {stderr}"
+    );
+    assert!(
+        stderr.contains("config: crawl.timeout = 9 (config)"),
+        "third config value: {stderr}"
+    );
+    assert!(
+        stderr.contains("config: crawl.concurrency = 100 (default)"),
+        "unset options keep built-in defaults: {stderr}"
+    );
+    assert!(stderr.contains("5/min"), "summary uses the config value: {stderr}");
+
+    // CLI overrides: the same options report `(cli)` and the summary follows.
+    let output = Command::new(ftw_bin())
+        .current_dir(&dir)
+        .env("HOME", &dir)
+        .args([
+            "crawl",
+            "--db",
+            &db_path.to_string_lossy(),
+            "--config",
+            &cfg_path.to_string_lossy(),
+            "--requests-per-minute",
+            "10",
+            "--max-pages",
+            "11",
+            "--verbose",
+        ])
+        .output()
+        .expect("run ftw crawl with overrides");
+    assert!(
+        output.status.success(),
+        "override crawl failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(
+        stderr.contains("config: crawl.requests_per_minute = 10 (cli)"),
+        "CLI beats config: {stderr}"
+    );
+    assert!(
+        stderr.contains("config: crawl.max_pages = 11 (cli)"),
+        "CLI beats config for pages: {stderr}"
+    );
+    assert!(
+        stderr.contains("config: crawl.timeout = 9 (config)"),
+        "unflagged options still come from config: {stderr}"
+    );
+    assert!(stderr.contains("10/min"), "summary uses the CLI value: {stderr}");
+
+    // No config anywhere: built-in defaults, unlimited, still successful.
+    // A fresh directory (the first one holds ftw.toml, which discovery
+    // would otherwise pick up).
+    let bare = config_dir(&format!("{tag}-bare"));
+    let output = Command::new(ftw_bin())
+        .current_dir(&bare)
+        .env("HOME", &bare)
+        .args([
+            "crawl",
+            "--db",
+            &bare.join("plain.db").to_string_lossy(),
+            "--verbose",
+        ])
+        .output()
+        .expect("run ftw crawl without config");
+    assert!(
+        output.status.success(),
+        "default crawl failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(
+        stderr.contains("config: crawl.requests_per_minute = 0 (default)"),
+        "built-in default with source: {stderr}"
+    );
+    assert!(stderr.contains("unlimited"), "default summary: {stderr}");
+
+    std::fs::remove_dir_all(&dir).ok();
+    std::fs::remove_dir_all(&bare).ok();
+}
+
+/// An explicit `--config` path that does not exist fails before any work,
+/// naming the path.
+#[test]
+fn explicit_config_missing_path_fails_before_work() {
+    let tag = temp_tag("cfg-missing");
+    let dir = config_dir(&tag);
+    let missing = dir.join("no-such.toml");
+    let output = Command::new(ftw_bin())
+        .current_dir(&dir)
+        .env("HOME", &dir)
+        .args([
+            "crawl",
+            "--db",
+            &dir.join("t.db").to_string_lossy(),
+            "--config",
+            &missing.to_string_lossy(),
+        ])
+        .output()
+        .expect("run ftw crawl with missing config");
+    assert!(
+        !output.status.success(),
+        "missing explicit config must fail"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(
+        stderr.contains(&missing.to_string_lossy().to_string()),
+        "error names the path: {stderr}"
+    );
+    assert!(
+        !dir.join("t.db").exists(),
+        "no database may be created before the config error"
+    );
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
+/// A typo'd config key fails naming the key and the file; a negative
+/// crawl rate limit and a bogus fingerprint scheme fail the same way.
+#[test]
+fn invalid_config_fails_with_key_and_path() {
+    let tag = temp_tag("cfg-invalid");
+    let dir = config_dir(&tag);
+    let db = dir.join("t.db").to_string_lossy().to_string();
+
+    let typo = write_config(&dir, "typo.toml", "[crawl]\nconcurrnecy = 5\n");
+    let output = Command::new(ftw_bin())
+        .current_dir(&dir)
+        .env("HOME", &dir)
+        .args(["crawl", "--db", &db, "--config", &typo.to_string_lossy()])
+        .output()
+        .expect("run with typo config");
+    assert!(!output.status.success(), "typo key must fail");
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(stderr.contains("concurrnecy"), "names the key: {stderr}");
+    assert!(
+        stderr.contains(&typo.to_string_lossy().to_string()),
+        "names the path: {stderr}"
+    );
+
+    let negative = write_config(&dir, "neg.toml", "[crawl]\nrequests_per_minute = -5\n");
+    let output = Command::new(ftw_bin())
+        .current_dir(&dir)
+        .env("HOME", &dir)
+        .args(["crawl", "--db", &db, "--config", &negative.to_string_lossy()])
+        .output()
+        .expect("run with negative limit");
+    assert!(!output.status.success(), "negative limit must fail");
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(stderr.contains("requests_per_minute"), "names the key: {stderr}");
+    assert!(
+        stderr.contains(&negative.to_string_lossy().to_string()),
+        "names the path: {stderr}"
+    );
+
+    let scheme = write_config(&dir, "scheme.toml", "[fingerprint]\nscheme = \"bogus\"\n");
+    let output = Command::new(ftw_bin())
+        .current_dir(&dir)
+        .env("HOME", &dir)
+        .args([
+            "fingerprint",
+            "--db",
+            &db,
+            "--config",
+            &scheme.to_string_lossy(),
+        ])
+        .output()
+        .expect("run with bogus scheme");
+    assert!(!output.status.success(), "bogus scheme must fail");
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(stderr.contains("scheme"), "names the key: {stderr}");
+
+    std::fs::remove_dir_all(&dir).ok();
+}
+
 /// A negative `--requests-per-minute` is rejected by clap before any
 /// crawling: both the `--flag=value` form (invalid value) and the separate
 /// form must fail.

@@ -76,6 +76,16 @@ under `scan` subcommand).
     `rate-limit wait <domain> <s>s` lines, summary with setting/waits/longest
     wait. No schema change, no other crawl flags. `cargo build` / clippy /
     `cargo test` 79/79 green (67 unit + 12 CLI). Changes left uncommitted.
+14. TOML config-file defaults applied and verified (v0.2.3, Cargo.toml only):
+    new `src/config.rs` (discovery `--config` > `./ftw.toml` >
+    `$HOME/.config/ftw/config.toml` > none; CLI > config > built-in
+    precedence via `Option` CLI args; unknown-key and invalid-value failures
+    naming path+key; int-or-float timeouts), `--config` on all three
+    subcommands, `[crawl.rate_limits]` per-domain overrides through the
+    limiter's canonicalization, verbose `config: <section>.<key> = <v>
+    (<source>)` lines. No schema change, no other new flags. `cargo build`
+    / clippy / `cargo test` 93/93 green (78 unit + 15 CLI). Committed,
+    tagged `v0.2.3`, and pushed.
 
 ## Recent state changes
 - 2026-10-23: added hacker-zine README.md + Kopimi LICENSE; banner swapped

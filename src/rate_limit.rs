@@ -28,6 +28,21 @@ use std::time::{Duration, Instant};
 /// Production sliding-window length: 60 seconds.
 pub const DEFAULT_WINDOW: Duration = Duration::from_secs(60);
 
+/// Normalize one host exactly as the limiter sees it: lowercase, one pair
+/// of IPv6 brackets stripped, one leading `www.` stripped.
+fn normalize_host(host: &str) -> String {
+    let lower = host.to_lowercase();
+    // IPv6 literals parse with brackets (`[::1]`); the canonical domain is
+    // the IP string itself, without them.
+    let bare = lower
+        .strip_prefix('[')
+        .and_then(|inner| inner.strip_suffix(']'))
+        .unwrap_or(&lower);
+    bare.strip_prefix("www.")
+        .map(str::to_string)
+        .unwrap_or_else(|| bare.to_string())
+}
+
 /// Canonical domain of one fetched URL: the lowercase host with a single
 /// leading `www.` stripped. Scheme and port are ignored (http and https to
 /// the same host share one limiter, as do different ports), IP hosts stay
@@ -38,21 +53,28 @@ pub const DEFAULT_WINDOW: Duration = Duration::from_secs(60);
 pub fn canonical_domain(raw_url: &str) -> String {
     reqwest::Url::parse(raw_url)
         .ok()
-        .and_then(|url| {
-            let host = url.host_str()?.to_lowercase();
-            // IPv6 literals parse with brackets (`[::1]`); the canonical
-            // domain is the IP string itself, without them.
-            let bare = host
-                .strip_prefix('[')
-                .and_then(|inner| inner.strip_suffix(']'))
-                .unwrap_or(&host);
-            Some(
-                bare.strip_prefix("www.")
-                    .map(str::to_string)
-                    .unwrap_or_else(|| bare.to_string()),
-            )
-        })
+        .and_then(|url| url.host_str().map(normalize_host))
         .unwrap_or_else(|| raw_url.to_string())
+}
+
+/// Canonicalize a per-domain config key through the same normalization, so
+/// config keys and runtime URLs meet: bare hosts, `host:port`, and full
+/// URLs all reduce identically (`www.wordpress.org` in config is
+/// `wordpress.org` at runtime).
+#[must_use]
+pub fn canonical_host(raw: &str) -> String {
+    let trimmed = raw.trim();
+    if let Ok(url) = reqwest::Url::parse(trimmed) {
+        if let Some(host) = url.host_str() {
+            return normalize_host(host);
+        }
+    }
+    if let Ok(url) = reqwest::Url::parse(&format!("http://{trimmed}")) {
+        if let Some(host) = url.host_str() {
+            return normalize_host(host);
+        }
+    }
+    normalize_host(trimmed)
 }
 
 /// One stderr line per rate-limit wait, printed live by the worker when its
@@ -76,11 +98,14 @@ struct LimiterState {
 }
 
 /// Shared sliding-window limiter: at most `limit` requests per `window` per
-/// canonical domain, across all workers holding an `Arc` clone combined.
+/// canonical domain, across all workers holding an `Arc` clone combined. A
+/// per-domain override (from `[crawl.rate_limits]`) replaces the default
+/// for that domain only.
 #[derive(Debug)]
 pub struct RateLimiter {
     limit: u64,
     window: Duration,
+    overrides: HashMap<String, u64>,
     state: std::sync::Mutex<LimiterState>,
 }
 
@@ -92,8 +117,22 @@ impl RateLimiter {
         Self {
             limit,
             window,
+            overrides: HashMap::new(),
             state: std::sync::Mutex::new(LimiterState::default()),
         }
+    }
+
+    /// Attach per-domain limits keyed by canonical domain. Keys are
+    /// canonicalized on the way in, so raw config spellings
+    /// (`www.wordpress.org`, `https://wordpress.org:443/`) land on the same
+    /// bucket the runtime lookup uses.
+    #[must_use]
+    pub fn with_overrides(mut self, overrides: HashMap<String, u64>) -> Self {
+        self.overrides = overrides
+            .into_iter()
+            .map(|(domain, limit)| (canonical_host(&domain), limit))
+            .collect();
+        self
     }
 
     /// Wait until a request to `domain` may start, record it, and return the
@@ -102,7 +141,8 @@ impl RateLimiter {
     /// count — they still hit the server. Redirects followed internally by
     /// the HTTP client are not separate acquires.
     pub async fn acquire(&self, domain: &str) -> Duration {
-        if self.limit == 0 {
+        let effective = self.overrides.get(domain).copied().unwrap_or(self.limit);
+        if effective == 0 {
             return Duration::ZERO;
         }
         let start = Instant::now();
@@ -121,7 +161,7 @@ impl RateLimiter {
                 while hits.front().is_some_and(|hit| *hit <= cutoff) {
                     hits.pop_front();
                 }
-                if (hits.len() as u64) < self.limit {
+                if (hits.len() as u64) < effective {
                     hits.push_back(Instant::now());
                     let waited = if slept { start.elapsed() } else { Duration::ZERO };
                     if slept {
@@ -131,7 +171,7 @@ impl RateLimiter {
                     return waited;
                 }
                 // The window is full: the oldest hit decides when a slot
-                // frees. It is always present here (`limit` is at least 1).
+                // frees. It is always present here (`effective` ≥ 1).
                 hits[0] + self.window
             };
             tokio::time::sleep_until(wake.into()).await;
@@ -202,6 +242,46 @@ mod tests {
             "::1",
             "IPv6 hosts stay as-is"
         );
+    }
+
+    /// Config keys canonicalize exactly like runtime URLs: bare hosts,
+    /// `host:port`, and full URLs all meet on the same bucket.
+    #[test]
+    fn canonical_host_matches_runtime_domains() {
+        assert_eq!(canonical_host("wordpress.org"), "wordpress.org");
+        assert_eq!(canonical_host("www.wordpress.org"), "wordpress.org");
+        assert_eq!(canonical_host("WWW.WordPress.Org"), "wordpress.org");
+        assert_eq!(
+            canonical_host("https://www.wordpress.org:443/docs/"),
+            "wordpress.org"
+        );
+        assert_eq!(canonical_host("wordpress.org:8080"), "wordpress.org");
+        assert_eq!(canonical_host("blog.wordpress.org"), "blog.wordpress.org");
+        assert_eq!(canonical_host("66.6.42.252"), "66.6.42.252");
+        assert_eq!(
+            canonical_domain("https://wordpress.org/about/"),
+            canonical_host("www.wordpress.org"),
+            "config key and runtime URL share one bucket"
+        );
+    }
+
+    /// A per-domain override replaces the global default for that domain
+    /// only; other domains keep the default.
+    #[tokio::test]
+    async fn per_domain_override_throttles_one_domain_only() {
+        let overrides = HashMap::from([("WWW.Example.COM".to_string(), 1)]);
+        let limiter = RateLimiter::new(60, Duration::from_millis(100)).with_overrides(overrides);
+        assert_eq!(limiter.acquire("example.com").await, Duration::ZERO);
+        let waited = limiter.acquire("example.com").await;
+        assert!(
+            waited >= Duration::from_millis(80),
+            "overridden domain throttles at 1/window, waited {waited:?}"
+        );
+        assert_eq!(limiter.waits(), 1);
+        for _ in 0..5 {
+            assert_eq!(limiter.acquire("other.test").await, Duration::ZERO);
+        }
+        assert_eq!(limiter.waits(), 1, "other domains keep the loose default");
     }
 
     /// The limiter allows a burst of N, then the (N+1)th blocks until the
