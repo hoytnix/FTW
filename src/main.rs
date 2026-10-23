@@ -2,6 +2,7 @@ mod crawl;
 mod db;
 mod fingerprint;
 mod output;
+mod rate_limit;
 mod scanner;
 mod targets;
 mod tech;
@@ -170,6 +171,10 @@ struct CrawlArgs {
     #[arg(long)]
     insecure: bool,
 
+    /// Maximum requests per minute per canonical domain (0 = unlimited)
+    #[arg(long, value_name = "N", default_value_t = 0)]
+    requests_per_minute: u64,
+
     /// Print one human-readable stderr line per event (elapsed + detail)
     #[arg(short, long, conflicts_with = "quiet")]
     verbose: bool,
@@ -294,19 +299,14 @@ async fn run_crawl(cli: CrawlArgs) -> Result<(), Box<dyn std::error::Error + Sen
         body_cap: cli.body_cap,
         max_redirects: cli.max_redirects,
         insecure: cli.insecure,
+        requests_per_minute: cli.requests_per_minute,
+        rate_window: rate_limit::DEFAULT_WINDOW,
     };
     let options = output::OutputOptions::new(cli.verbose, cli.quiet);
     let stats = crawl::run_with_options(&config, cli.db, options).await?;
     eprintln!(
-        "ftw: crawled {} pages, {} links discovered ({} external skipped); errors: {} timeout, {} tls, {} connect, {} other; {} pages hit the body cap",
-        stats.visited,
-        stats.links_discovered,
-        stats.links_external,
-        stats.timeouts,
-        stats.tls_errors,
-        stats.connect_errors,
-        stats.other_errors,
-        stats.body_cap_hits,
+        "{}",
+        crawl::format_summary(&stats, cli.requests_per_minute)
     );
     Ok(())
 }

@@ -6,7 +6,7 @@
 - `cargo build` clean, 0 warnings.
 - `cargo clippy --all-targets -- -D warnings` clean (system stable toolchain;
   clippy 0.1.99).
-- `cargo test` 70/70 green (59 unit + 11 CLI in `tests/live_output.rs`).
+- `cargo test` 79/79 green (67 unit + 12 CLI in `tests/live_output.rs`).
   Scan/fingerprint detection, fetch-mode, tech, and verbose/quiet behavior
   unchanged; results moved from files to the master SQLite database, and the
   new `crawl` subcommand is covered (chain/cycle/external/depth, non-HTML,

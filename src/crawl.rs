@@ -32,7 +32,7 @@ use reqwest::redirect::Policy;
 use scraper::{Html, Selector};
 use tokio::sync::{Semaphore, mpsc};
 
-use crate::{db, output};
+use crate::{db, output, rate_limit};
 
 const CHANNEL_CAPACITY: usize = 1024;
 
@@ -46,6 +46,12 @@ pub struct CrawlConfig {
     pub body_cap: usize,
     pub max_redirects: usize,
     pub insecure: bool,
+    /// Maximum requests per minute per canonical domain (`0` = unlimited,
+    /// which preserves the old unthrottled behavior exactly).
+    pub requests_per_minute: u64,
+    /// Sliding-window length for the rate limiter (60 seconds in
+    /// production; tests pass shorter windows).
+    pub rate_window: Duration,
 }
 
 /// One crawled page. `url` is the normalized URL (dedupe key);
@@ -89,6 +95,12 @@ pub struct CrawlStats {
     pub connect_errors: usize,
     pub other_errors: usize,
     pub body_cap_hits: usize,
+    /// Acquires that blocked on a domain rate limit at least once. Filled in
+    /// by the coordinator after the writer finishes (the writer only sees
+    /// pages and links).
+    pub rate_limit_waits: usize,
+    /// Longest single acquire's total rate-limit wait.
+    pub longest_rate_wait: Duration,
 }
 
 impl CrawlStats {
@@ -112,6 +124,33 @@ impl CrawlStats {
             self.links_external += 1;
         }
     }
+}
+
+/// One stderr summary line for a crawl run, including the rate-limit
+/// setting and its observed waits. Kept as a function (instead of inline in
+/// the CLI wiring) so tests can assert the exact tokens without spawning
+/// the binary.
+#[must_use]
+pub fn format_summary(stats: &CrawlStats, requests_per_minute: u64) -> String {
+    let limit = if requests_per_minute == 0 {
+        "unlimited".to_string()
+    } else {
+        format!("{requests_per_minute}/min")
+    };
+    format!(
+        "ftw: crawled {} pages, {} links discovered ({} external skipped); errors: {} timeout, {} tls, {} connect, {} other; {} pages hit the body cap; rate limit {}, {} waits, longest wait {:.2}s",
+        stats.visited,
+        stats.links_discovered,
+        stats.links_external,
+        stats.timeouts,
+        stats.tls_errors,
+        stats.connect_errors,
+        stats.other_errors,
+        stats.body_cap_hits,
+        limit,
+        stats.rate_limit_waits,
+        stats.longest_rate_wait.as_secs_f64(),
+    )
 }
 
 /// The seed host a crawled URL came from. In-scope means the same host, and
@@ -389,6 +428,14 @@ pub async fn run(
 /// The database is opened once here, seeds are read, and the single
 /// connection is moved into the writer task — the only task that writes.
 /// Workers never open connections or write directly.
+///
+/// Polite crawling: every worker shares one [`rate_limit::RateLimiter`]
+/// (per canonical domain, across all threads combined). Each fetch waits
+/// out its domain's rate limit FIRST with no concurrency permit held, then
+/// takes a semaphore permit, then fetches — so a worker stalled on one
+/// domain's limit never occupies a fetch slot needed by other domains. The
+/// coordinator therefore spawns one task per frontier job without gating:
+/// waiting tasks hold nothing, and total tasks stay bounded by `max_pages`.
 pub async fn run_with_options(
     config: &CrawlConfig,
     db_path: PathBuf,
@@ -401,6 +448,11 @@ pub async fn run_with_options(
     }
     let client = build_client(config)?;
     eprintln!("ftw: crawling {} seed pages", seeds.len());
+    let limiter = Arc::new(rate_limit::RateLimiter::new(
+        config.requests_per_minute,
+        config.rate_window,
+    ));
+    let verbose = options.verbose;
     let (db_tx, db_rx) = mpsc::channel::<CrawlEvent>(CHANNEL_CAPACITY);
     let writer =
         tokio::spawn(async move { output::run_crawl_db_writer(db_rx, conn, options).await });
@@ -431,16 +483,11 @@ pub async fn run_with_options(
 
     let mut in_flight = 0usize;
     while !frontier.is_empty() || in_flight > 0 {
-        // Producer gate: acquire the permit BEFORE spawning, so in-flight
-        // workers never exceed the concurrency limit.
+        // Spawn one task per frontier job with no permit held: the worker
+        // rate-waits first (holding nothing), then takes a fetch permit.
+        // Waiting tasks therefore never starve other domains' fetches.
         while visited.len() < config.max_pages && !frontier.is_empty() {
-            let permit = semaphore
-                .clone()
-                .acquire_owned()
-                .await
-                .expect("crawl semaphore never closes while crawling");
             let Some(job) = frontier.pop_front() else {
-                drop(permit);
                 break;
             };
             in_flight += 1;
@@ -449,8 +496,19 @@ pub async fn run_with_options(
             let coord_tx = coord_tx.clone();
             let client = client.clone();
             let config = *config;
+            let limiter = limiter.clone();
+            let semaphore = semaphore.clone();
             tokio::spawn(async move {
                 let outcome_job_url = job_url.clone();
+                let domain = rate_limit::canonical_domain(&job.url);
+                let waited = limiter.acquire(&domain).await;
+                if verbose && !waited.is_zero() {
+                    eprintln!("{}", rate_limit::format_rate_wait(&domain, waited));
+                }
+                let permit = semaphore
+                    .acquire_owned()
+                    .await
+                    .expect("crawl semaphore never closes while crawling");
                 let (page, links) = fetch_page(&client, &job, &config).await;
                 drop(permit);
                 let _ = db_tx.send(CrawlEvent::Page(page)).await;
@@ -510,7 +568,9 @@ pub async fn run_with_options(
     }
     drop(db_tx);
     drop(coord_tx);
-    let stats = writer.await??;
+    let mut stats = writer.await??;
+    stats.rate_limit_waits = limiter.waits();
+    stats.longest_rate_wait = limiter.longest_wait();
     Ok(stats)
 }
 
@@ -532,6 +592,8 @@ mod tests {
             body_cap: 262144,
             max_redirects: 5,
             insecure: false,
+            requests_per_minute: 0,
+            rate_window: Duration::from_secs(60),
         }
     }
 
@@ -616,6 +678,38 @@ mod tests {
         Redirect(String),
     }
 
+    /// Render one test response for a routed path key.
+    fn respond(routes: &HashMap<String, TestRoute>, key: &str) -> String {
+        match routes.get(key) {
+            Some(TestRoute::Html(body)) => format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+            Some(TestRoute::Raw { content_type, body }) => format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            ),
+            Some(TestRoute::Redirect(location)) => format!(
+                "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+            ),
+            None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                .to_string(),
+        }
+    }
+
+    /// Read one request and return its routed path key (query stripped).
+    async fn request_key(sock: &mut tokio::net::TcpStream) -> String {
+        let mut buf = [0u8; 8192];
+        let _ = tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf)).await;
+        let text = String::from_utf8_lossy(&buf).into_owned();
+        let path = text
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or("/");
+        path.split('?').next().unwrap_or("/").to_string()
+    }
+
     /// Route-serving test server: matches the request path (query stripped)
     /// against `routes`, 404 otherwise. Reads the request first so every
     /// method behaves. The routes are built with the bound address, so pages
@@ -636,37 +730,52 @@ mod tests {
                 };
                 let routes = routes.clone();
                 tokio::spawn(async move {
-                    let mut buf = [0u8; 8192];
-                    let _ =
-                        tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf)).await;
-                    let text = String::from_utf8_lossy(&buf).into_owned();
-                    let path = text
-                        .lines()
-                        .next()
-                        .and_then(|line| line.split_whitespace().nth(1))
-                        .unwrap_or("/");
-                    let key = path.split('?').next().unwrap_or("/");
-                    let response = match routes.get(key) {
-                        Some(TestRoute::Html(body)) => format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        ),
-                        Some(TestRoute::Raw { content_type, body }) => format!(
-                            "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                            body.len()
-                        ),
-                        Some(TestRoute::Redirect(location)) => format!(
-                            "HTTP/1.1 302 Found\r\nLocation: {location}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                        ),
-                        None => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
-                            .to_string(),
-                    };
+                    let key = request_key(&mut sock).await;
+                    let response = respond(&routes, &key);
                     let _ = sock.write_all(response.as_bytes()).await;
                     let _ = sock.shutdown().await;
                 });
             }
         });
         (addr, handle)
+    }
+
+    /// Timestamp-logging route server bound to an explicit loopback IP, so
+    /// two servers can live on different canonical domains (ports are
+    /// ignored by the rate limiter). Records one `Instant` per accepted
+    /// connection — the fetch arrival order — alongside serving routes.
+    async fn spawn_timestamp_server(
+        bind_ip: &str,
+        build: impl FnOnce(std::net::SocketAddr) -> HashMap<String, TestRoute>,
+    ) -> (
+        std::net::SocketAddr,
+        Arc<std::sync::Mutex<Vec<std::time::Instant>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind(format!("{bind_ip}:0"))
+            .await
+            .expect("bind timestamp server");
+        let addr = listener.local_addr().expect("timestamp server addr");
+        let routes = build(addr);
+        let stamps = Arc::new(std::sync::Mutex::new(Vec::<std::time::Instant>::new()));
+        let seen = stamps.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                seen.lock().expect("stamp log").push(std::time::Instant::now());
+                let routes = routes.clone();
+                tokio::spawn(async move {
+                    let key = request_key(&mut sock).await;
+                    let response = respond(&routes, &key);
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (addr, stamps, handle)
     }
 
     /// A port nothing listens on (bind-then-drop, loopback only).
@@ -1090,6 +1199,146 @@ mod tests {
         let (status, _, _, _, links_found) = page_detail(&db_path, &url);
         assert_eq!(status, None);
         assert_eq!(links_found, 0);
+        remove_db(&db_path);
+    }
+
+    /// The stderr summary carries the rate-limit setting and its waits.
+    #[test]
+    fn crawl_summary_reports_rate_limit_setting_and_waits() {
+        let stats = CrawlStats {
+            visited: 3,
+            links_discovered: 2,
+            rate_limit_waits: 2,
+            longest_rate_wait: Duration::from_millis(500),
+            ..Default::default()
+        };
+        let line = format_summary(&stats, 60);
+        assert!(
+            line.starts_with("ftw: crawled 3 pages"),
+            "summary keeps its existing shape: {line}"
+        );
+        assert!(line.contains("60/min"), "summary names the setting: {line}");
+        assert!(line.contains("2 waits"), "summary counts the waits: {line}");
+        assert!(
+            line.contains("longest wait"),
+            "summary names the longest wait: {line}"
+        );
+        let unlimited = format_summary(&CrawlStats::default(), 0);
+        assert!(
+            unlimited.contains("unlimited"),
+            "a zero limit reports unlimited: {unlimited}"
+        );
+        assert!(
+            unlimited.contains("0 waits"),
+            "an unthrottled run reports zero waits: {unlimited}"
+        );
+    }
+
+    /// Rate limiting end to end with a 500 ms test window at 1 request per
+    /// window: three pages on 127.0.0.1 arrive one window apart (two waits),
+    /// while the 127.0.0.2 seed — a different canonical domain — arrives
+    /// promptly instead of queueing behind the first domain's limit.
+    #[tokio::test]
+    async fn crawl_throttles_one_domain_without_blocking_another() {
+        let db_path = temp_db("ratelimit");
+        let (addr_a, stamps_a, server_a) = spawn_timestamp_server("127.0.0.1", |addr| {
+            let base = format!("http://{addr}");
+            let mut routes = HashMap::new();
+            routes.insert(
+                "/seed".to_string(),
+                html_page("Seed", &[format!("{base}/a1"), format!("{base}/a2")]),
+            );
+            routes.insert("/a1".to_string(), html_page("A1", &[]));
+            routes.insert("/a2".to_string(), html_page("A2", &[]));
+            routes
+        })
+        .await;
+        let (addr_b, stamps_b, server_b) = spawn_timestamp_server("127.0.0.2", |_| {
+            let mut routes = HashMap::new();
+            routes.insert("/seed".to_string(), html_page("Seed", &[]));
+            routes
+        })
+        .await;
+        seed_fingerprint(&db_path, addr_a.port(), &format!("http://{addr_a}/seed"), 200);
+        seed_fingerprint(&db_path, addr_b.port(), &format!("http://{addr_b}/seed"), 200);
+        let config = CrawlConfig {
+            requests_per_minute: 1,
+            rate_window: Duration::from_millis(500),
+            ..test_config(2, 100)
+        };
+        let start = std::time::Instant::now();
+        let stats = run_with_options(&config, db_path.clone(), output::OutputOptions::default())
+            .await
+            .expect("crawl run");
+        server_a.abort();
+        server_b.abort();
+
+        assert_eq!(stats.visited, 4, "all seeds and children visited");
+        assert_eq!(
+            stats.rate_limit_waits, 2,
+            "exactly the two over-limit fetches waited: {stats:?}"
+        );
+        assert!(
+            stats.longest_rate_wait >= Duration::from_millis(400),
+            "the longest wait spans a full window: {:?}",
+            stats.longest_rate_wait
+        );
+
+        let mut arrivals_a = stamps_a.lock().expect("stamp log").clone();
+        arrivals_a.sort_unstable();
+        assert_eq!(arrivals_a.len(), 3, "three fetches hit 127.0.0.1");
+        assert!(
+            arrivals_a[1] - arrivals_a[0] >= Duration::from_millis(400),
+            "second fetch waits out a window: {:?}",
+            arrivals_a
+        );
+        assert!(
+            arrivals_a[2] - arrivals_a[0] >= Duration::from_millis(900),
+            "third fetch waits out two windows: {:?}",
+            arrivals_a
+        );
+
+        let arrivals_b = stamps_b.lock().expect("stamp log").clone();
+        assert_eq!(arrivals_b.len(), 1, "one fetch hit 127.0.0.2");
+        assert!(
+            arrivals_b[0] - start < Duration::from_millis(400),
+            "the other domain proceeds without waiting: {:?}",
+            arrivals_b[0] - start
+        );
+        remove_db(&db_path);
+    }
+
+    /// A zero limit crawls with no throttling: all pages visited, no waits,
+    /// no longest wait — unlimited is never "0 requests allowed".
+    #[tokio::test]
+    async fn crawl_unlimited_records_no_waits() {
+        let db_path = temp_db("unlimited");
+        let (addr, server) = spawn_route_server_with(|addr| {
+            let base = format!("http://{addr}");
+            let mut routes = HashMap::new();
+            routes.insert(
+                "/seed".to_string(),
+                html_page("Seed", &[format!("{base}/a1"), format!("{base}/a2")]),
+            );
+            routes.insert("/a1".to_string(), html_page("A1", &[]));
+            routes.insert("/a2".to_string(), html_page("A2", &[]));
+            routes
+        })
+        .await;
+        let base = format!("http://{addr}");
+        seed_fingerprint(&db_path, addr.port(), &format!("{base}/seed"), 200);
+        let stats = run_with_options(
+            &test_config(2, 100),
+            db_path.clone(),
+            output::OutputOptions::default(),
+        )
+        .await
+        .expect("crawl run");
+        server.abort();
+
+        assert_eq!(stats.visited, 3);
+        assert_eq!(stats.rate_limit_waits, 0);
+        assert_eq!(stats.longest_rate_wait, Duration::ZERO);
         remove_db(&db_path);
     }
 }

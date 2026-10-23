@@ -668,6 +668,10 @@ fn crawl_end_to_end_visits_chain_and_skips_external() {
     );
     let stderr = String::from_utf8(crawl.stderr).expect("stderr utf8");
     assert!(stderr.contains("crawled 3 pages"), "summary reports 3 pages: {stderr}");
+    assert!(
+        stderr.contains("unlimited"),
+        "default runs report an unlimited rate limit: {stderr}"
+    );
 
     let base = format!("http://127.0.0.1:{http_port}");
     let mut pages = db_text_rows(&db_path, "SELECT url FROM crawl_pages");
@@ -799,6 +803,43 @@ fn fingerprint_no_prefer_https_fingerprints_both() {
         !stderr.contains("skipped 127.0.0.1:80"),
         "no skip line is printed with deduplication off: {stderr}"
     );
+
+    remove_db(&db_path);
+}
+
+/// A negative `--requests-per-minute` is rejected by clap before any
+/// crawling: both the `--flag=value` form (invalid value) and the separate
+/// form must fail.
+#[test]
+fn crawl_rejects_negative_requests_per_minute() {
+    let tag = temp_tag("rate-limit-flag");
+    let db_path = temp_path(&tag, "db");
+
+    for args in [
+        vec![
+            "crawl",
+            "--db",
+            &db_path.to_string_lossy(),
+            "--requests-per-minute=-1",
+        ],
+        vec![
+            "crawl",
+            "--db",
+            &db_path.to_string_lossy(),
+            "--requests-per-minute",
+            "-1",
+        ],
+    ] {
+        let output = Command::new(ftw_bin())
+            .args(&args)
+            .output()
+            .expect("run ftw crawl with negative limit");
+        assert!(
+            !output.status.success(),
+            "negative --requests-per-minute must be rejected: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 
     remove_db(&db_path);
 }

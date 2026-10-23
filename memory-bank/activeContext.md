@@ -68,6 +68,14 @@ under `scan` subcommand).
     `skipped_prefer_https=1` + `fallback_to_http=0`. `cargo build` /
     clippy / `cargo test` 70/70 green (59 unit + 11 CLI). Changes left
     uncommitted.
+13. Crawl per-domain rate limiting applied and verified: new
+    `src/rate_limit.rs` (canonical domains, shared Arc sliding-window
+    limiter, 60 s production window), `ftw crawl --requests-per-minute <N>`
+    (default 0 = unlimited, negatives rejected by clap), worker order
+    rate-wait → semaphore → fetch with no permit held while waiting, verbose
+    `rate-limit wait <domain> <s>s` lines, summary with setting/waits/longest
+    wait. No schema change, no other crawl flags. `cargo build` / clippy /
+    `cargo test` 79/79 green (67 unit + 12 CLI). Changes left uncommitted.
 
 ## Recent state changes
 - 2026-10-23: added hacker-zine README.md + Kopimi LICENSE; banner swapped
