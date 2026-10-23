@@ -390,6 +390,119 @@ pub fn upsert_host_check(
     Ok(())
 }
 
+/// One fingerprint row projected for offline reporting (`ftw list`): only
+/// the signal columns, with the JSON signal lists parsed. Unparseable lists
+/// fall back to empty — the writer only stores valid JSON, so this is purely
+/// defensive.
+pub struct ListFingerprintRow {
+    pub ip: String,
+    pub port: u16,
+    pub scheme: String,
+    pub server: Option<String>,
+    pub php_detected: bool,
+    pub php_version: Option<String>,
+    pub php_signals: Vec<String>,
+    pub wordpress_detected: bool,
+    pub wordpress_version: Option<String>,
+    pub wordpress_signals: Vec<String>,
+    pub php_apps: Vec<crate::tech::PhpApp>,
+    /// True when the fingerprint attempt got an HTTP status (vs a transport
+    /// error): rows with a status carry the signals the display port is
+    /// chosen from.
+    pub has_status: bool,
+}
+
+/// Every fingerprint row, for offline reporting. No filtering here: callers
+/// union signals across an IP's rows and prefer the 443 record when choosing
+/// the display port.
+pub fn read_fingerprint_rows(conn: &Connection) -> Result<Vec<ListFingerprintRow>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT ip, port, scheme, server, php_detected, php_version, php_signals,
+                wordpress_detected, wordpress_version, wordpress_signals, php_apps, status
+         FROM fingerprint_results",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let php_signals_text: String = row.get(6)?;
+        let wordpress_signals_text: String = row.get(9)?;
+        let php_apps_text: String = row.get(10)?;
+        let status: Option<i64> = row.get(11)?;
+        Ok(ListFingerprintRow {
+            ip: row.get(0)?,
+            port: row.get(1)?,
+            scheme: row.get(2)?,
+            server: row.get(3)?,
+            php_detected: row.get(4)?,
+            php_version: row.get(5)?,
+            php_signals: serde_json::from_str(&php_signals_text).unwrap_or_default(),
+            wordpress_detected: row.get(7)?,
+            wordpress_version: row.get(8)?,
+            wordpress_signals: serde_json::from_str(&wordpress_signals_text).unwrap_or_default(),
+            php_apps: serde_json::from_str(&php_apps_text).unwrap_or_default(),
+            has_status: status.is_some(),
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
+/// Every probe record, parsed from the stored JSON. Rows that fail to parse
+/// are skipped — the writer only stores valid records, so this is purely
+/// defensive.
+pub fn read_probe_records(conn: &Connection) -> Result<Vec<crate::probe::ProbeRecord>, rusqlite::Error> {
+    let mut stmt = conn.prepare("SELECT record_json FROM probe_results")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for row in rows {
+        let json: String = row?;
+        if let Ok(record) = serde_json::from_str(&json) {
+            out.push(record);
+        }
+    }
+    Ok(out)
+}
+
+/// One host-check row projected for offline reporting: the verbatim `php -v`
+/// output plus `packages_raw` reconstructed from the stored package list
+/// (`name version` per line), so the CVE backport-proof substring search in
+/// [`crate::cve_check`] sees the same text the writer parsed it from.
+pub struct ListHostCheckRow {
+    pub host: String,
+    pub php_version: Option<String>,
+    pub php_raw: String,
+    pub packages_raw: String,
+}
+
+/// Every host-check row, for offline reporting.
+pub fn read_host_check_rows(conn: &Connection) -> Result<Vec<ListHostCheckRow>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT host, php_version, php_raw, packages_json FROM host_check_results",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let packages_text: String = row.get::<_, String>(3)?;
+        let packages: Vec<crate::host_check::PhpPackage> =
+            serde_json::from_str(&packages_text).unwrap_or_default();
+        let packages_raw = packages
+            .iter()
+            .map(|package| format!("{} {}", package.name, package.version))
+            .collect::<Vec<_>>()
+            .join("\n");
+        Ok(ListHostCheckRow {
+            host: row.get(0)?,
+            php_version: row.get(1)?,
+            php_raw: row.get(2)?,
+            packages_raw,
+        })
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 /// Record one extracted link, including external links that are never
 /// fetched. Repeats are ignored, so cycles cannot duplicate rows.
 pub fn insert_crawl_link(

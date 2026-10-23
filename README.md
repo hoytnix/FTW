@@ -10,7 +10,7 @@
                        \__|         \__|   \__/     \__|
                              >> FUCK TEH WORLD
           Event-Driven Asynchronous Multi-Threaded PHP2Shell Scanner
-                                    v0.3.0
+                                    v0.3.1
 ================================================================================
                      .o.                  .-"""-.
                     /o o\                / .--. \

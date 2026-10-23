@@ -9,7 +9,25 @@ strategy (HEAD then GET only when needed; `fetch_method`/`head_status`
 fields). Phase 1 `scan` behavior and output format unchanged (flags moved
 under `scan` subcommand).
 
-## Active work stream
+## Active work stream (newest: `ftw list`)
+19. New `ftw list` offline reporting subcommand applied and verified: new
+    `src/list.rs` (three overlapping lists in order — Running PHP via the
+    shared `cve_check::assess` gate, fingerprinted application via
+    wordpress/php_apps/probe generator-meta signals, PHP2Shell vulnerable on
+    verdict `vulnerable` only; dedup by host/IP preferring the 443 record;
+    table with headed sections + summary, JSONL with `category` per entry
+    matching existing JSONL conventions, `--output`, `--type`, `--cve`
+    override file, `--db`/`--config`/`-v`/`-q` like other subcommands; no
+    requests, no SSH, no new scanning), `db.rs` read helpers
+    (`read_fingerprint_rows`/`read_probe_records`/`read_host_check_rows`,
+    backport text reconstructed from stored packages), `[list]`
+    config section (verbose/quiet), one-word `probe::stack_from_text`
+    visibility reuse. Verified: `cargo build` clean,
+    `cargo clippy --all-targets -- -D warnings` clean,
+    `cargo test` 148/148 green (122 unit incl. 9 new fixture-DB list tests +
+    8 new CLI list tests + 18 pre-existing CLI). Left uncommitted, not pushed.
+
+## Active work stream (older)
 1. Restructured CLI into `scan` / `probe` subcommands (clap derive).
 2. Added `src/probe.rs` (scan-output parsing, HTTPS-first/auto logic, TLS
    classification, PHP fingerprinting, semaphore-gated pipeline) and a JSON
@@ -137,7 +155,14 @@ under `scan` subcommand).
     `cargo build` clean, `cargo clippy --all-targets -- -D warnings` clean,
     `cargo test` 113/113 green (97 unit + 16 CLI). Changes left uncommitted.
 
-## Recent state changes
+## Recent state changes (newest first)
+- 2026-10-23: `ftw list` offline reporting subcommand complete and verified
+  (build clean, clippy clean, 148/148 tests green: 122 unit + 8 list CLI +
+  18 pre-existing CLI). Three overlapping DB-only lists (PHP / application /
+  PHP2Shell vulnerable), `--type`/`--format table|json`/`--output`/`--cve`,
+  JSONL shape documented in help. Left uncommitted.
+
+## Recent state changes (older)
 - 2026-10-23: README.md now documents the new fingerprinting tech (`ftw
   probe` 0x05 + `ftw host-check` 0x06, `[probe]`/`[host_check]` config,
   renumbered config/full-run/greetz sections, test count 93→113).

@@ -190,6 +190,13 @@ pub struct HostCheckSection {
 
 #[derive(Debug, Default, serde::Deserialize)]
 #[serde(deny_unknown_fields, default)]
+pub struct ListSection {
+    pub verbose: Option<bool>,
+    pub quiet: Option<bool>,
+}
+
+#[derive(Debug, Default, serde::Deserialize)]
+#[serde(deny_unknown_fields, default)]
 pub struct FileConfig {
     pub global: GlobalSection,
     pub scan: ScanSection,
@@ -198,6 +205,7 @@ pub struct FileConfig {
     pub probe: ProbeSection,
     #[serde(alias = "host-check")]
     pub host_check: HostCheckSection,
+    pub list: ListSection,
 }
 
 /// Known fields per section. `[crawl.rate_limits]` keys are canonical
@@ -247,6 +255,7 @@ fn section_fields(section: &str) -> &'static [&'static str] {
             "verbose",
             "quiet",
         ],
+        "list" => &["verbose", "quiet"],
         _ => &[],
     }
 }

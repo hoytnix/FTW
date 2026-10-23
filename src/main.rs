@@ -4,6 +4,7 @@ mod cve_check;
 mod db;
 mod fingerprint;
 mod host_check;
+mod list;
 mod output;
 mod probe;
 mod rate_limit;
@@ -51,6 +52,61 @@ enum Commands {
     /// fingerprint, and host-check JSONL files (authorized ranges only;
     /// no requests, no exploits — version comparison only).
     CveCheck(CveCheckArgs),
+    /// List sites by type from the master database (offline reporting only:
+    /// no requests, no SSH, no port probes — existing results grouped into
+    /// overlapping PHP / application / PHP2Shell-vulnerable lists).
+    List(ListArgs),
+}
+
+/// Reporting flags. `list` is the subcommand name (`sites` is not a
+/// subcommand). Reads existing results from `--db` plus an optional
+/// `ftw cve-check` JSONL file and groups them; `--type` selects which of
+/// the three overlapping lists to show.
+#[derive(Debug, Args)]
+struct ListArgs {
+    /// Master SQLite database file holding all scan/fingerprint/probe/host-check
+    /// results (default ftw.db)
+    #[arg(long, value_name = "FILE")]
+    db: Option<PathBuf>,
+
+    /// cve-check JSONL file (`ftw cve-check` output records) for the
+    /// vulnerable list. When given, its verdicts decide that list: hosts the
+    /// file does not name are never listed as vulnerable. When omitted, the
+    /// cve-check verdict logic and fixed-version table are applied to the
+    /// versions already stored in the database.
+    #[arg(long, value_name = "FILE")]
+    cve: Option<PathBuf>,
+
+    /// Which list(s) to show (default all)
+    #[arg(long = "type", value_enum)]
+    site_type: Option<list::ListType>,
+
+    /// Output shape (default table). `table` prints three headed sections in
+    /// order (PHP, application, PHP2Shell vulnerable), each with its count,
+    /// then a summary. `json` streams one JSON object per list entry (JSONL,
+    /// matching other FTW outputs: `category`, `host`, `ip`, `port`,
+    /// `scheme`, `php_version`, `applications`, `cve_ids`, `verdict`,
+    /// `reason`) and prints the summary to stderr so stdout stays parseable.
+    #[arg(long, value_enum)]
+    format: Option<list::ListFormat>,
+
+    /// Write the report here instead of stdout (same `--format` shape)
+    #[arg(long, value_name = "FILE")]
+    output: Option<PathBuf>,
+
+    /// Config file with persistent defaults (discovery order when omitted:
+    /// ./ftw.toml, then $HOME/.config/ftw/config.toml)
+    #[arg(long, value_name = "FILE")]
+    config: Option<PathBuf>,
+
+    /// Print one human-readable stderr line per event (elapsed + detail)
+    #[arg(short, long, conflicts_with = "quiet")]
+    verbose: bool,
+
+    /// Print nothing to the terminal during the run except errors and the
+    /// final summary to stderr (report still written to stdout or --output)
+    #[arg(short, long, conflicts_with = "verbose")]
+    quiet: bool,
 }
 
 /// Offline CVE assessment flags. Inputs are existing JSONL files only.
@@ -341,6 +397,7 @@ async fn main() {
         Commands::Probe(args) => run_probe(args).await,
         Commands::HostCheck(args) => run_host_check(args).await,
         Commands::CveCheck(args) => run_cve_check(args),
+        Commands::List(args) => run_list(args),
     };
     if let Err(err) = result {
         eprintln!("ftw: error: {err}");
@@ -832,6 +889,187 @@ fn run_cve_check(cli: CveCheckArgs) -> Result<(), Box<dyn std::error::Error + Se
         }
     }
     eprintln!("{}", cve_check::format_summary(&summary));
+    Ok(())
+}
+
+/// Read one `ftw cve-check` JSONL output file into host-keyed verdict
+/// overrides for `ftw list`. Malformed lines and lines without a host are
+/// warned about (with file and line number) and skipped.
+fn read_cve_overrides(
+    path: &PathBuf,
+) -> Result<std::collections::HashMap<String, list::CveOverride>, Box<dyn std::error::Error + Send + Sync>> {
+    let text = std::fs::read_to_string(path)
+        .map_err(|err| format!("cannot read {}: {err}", path.display()))?;
+    let mut overrides = std::collections::HashMap::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let value: serde_json::Value = match serde_json::from_str(line) {
+            Ok(value) => value,
+            Err(err) => {
+                eprintln!(
+                    "ftw: warning: skipping invalid JSON on line {} of {}: {err}",
+                    index + 1,
+                    path.display()
+                );
+                continue;
+            }
+        };
+        let key = value
+            .get("host")
+            .and_then(|host| host.as_str())
+            .and_then(list::site_key);
+        let Some(key) = key else {
+            eprintln!(
+                "ftw: warning: skipping line {} of {}: no host field",
+                index + 1,
+                path.display()
+            );
+            continue;
+        };
+        overrides.insert(
+            key,
+            list::CveOverride {
+                verdict: value
+                    .get("verdict")
+                    .and_then(|verdict| verdict.as_str())
+                    .unwrap_or("not_applicable")
+                    .to_string(),
+                reason: value
+                    .get("reason")
+                    .and_then(|reason| reason.as_str())
+                    .unwrap_or("")
+                    .to_string(),
+                cve_ids: value
+                    .get("cve_ids")
+                    .and_then(|ids| ids.as_array())
+                    .map(|ids| {
+                        ids.iter()
+                            .filter_map(|id| id.as_str().map(str::to_owned))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+            },
+        );
+    }
+    Ok(overrides)
+}
+
+/// Write the report text to `--output` when given, else stdout. Stdout is
+/// flushed before returning so the report is never truncated.
+fn emit_list_report(
+    output: &Option<PathBuf>,
+    text: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match output {
+        Some(path) => std::fs::write(path, text)
+            .map_err(|err| format!("cannot write {}: {err}", path.display()))?,
+        None => {
+            use std::io::Write as _;
+            let stdout = std::io::stdout();
+            let mut writer = std::io::BufWriter::new(stdout.lock());
+            writer
+                .write_all(text.as_bytes())
+                .map_err(|err| format!("cannot write stdout: {err}"))?;
+            writer
+                .flush()
+                .map_err(|err| format!("cannot write stdout: {err}"))?;
+        }
+    }
+    Ok(())
+}
+
+fn run_list(cli: ListArgs) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let cfg_path = config::discover(cli.config.as_deref())?;
+    let file = match &cfg_path {
+        Some(path) => config::load(path)?,
+        None => config::FileConfig::default(),
+    };
+    let cfg = &file.list;
+    let (db, db_src) = config::resolve(
+        cli.db,
+        file.global.db.clone(),
+        PathBuf::from("ftw.db"),
+    );
+    let site_type = cli.site_type.unwrap_or_default();
+    let type_src = if cli.site_type.is_some() {
+        Source::Cli
+    } else {
+        Source::Default
+    };
+    let format = cli.format.unwrap_or_default();
+    let format_src = if cli.format.is_some() {
+        Source::Cli
+    } else {
+        Source::Default
+    };
+    let cve_src = if cli.cve.is_some() {
+        Source::Cli
+    } else {
+        Source::Default
+    };
+    let (verbose, _) = config::resolve_flag(cli.verbose, cfg.verbose, false);
+    let (quiet, _) = config::resolve_flag(cli.quiet, cfg.quiet, false);
+    if verbose && quiet {
+        return Err("verbose and quiet conflict: enable only one".to_string().into());
+    }
+    if verbose {
+        let db_section = if db_src == Source::Config {
+            "global"
+        } else {
+            "list"
+        };
+        eprintln!("{}", config::line(db_section, "db", &db.display().to_string(), db_src));
+        eprintln!("{}", config::line("list", "type", site_type.as_str(), type_src));
+        eprintln!("{}", config::line("list", "format", format.as_str(), format_src));
+        eprintln!(
+            "{}",
+            config::line(
+                "list",
+                "cve",
+                &cli.cve
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                cve_src,
+            )
+        );
+    }
+    let overrides = match &cli.cve {
+        Some(path) => Some(read_cve_overrides(path)?),
+        None => None,
+    };
+    if !quiet {
+        eprintln!("ftw: listing sites from {}", db.display());
+    }
+    let conn = db::open(&db)?;
+    let fingerprint = db::read_fingerprint_rows(&conn)?;
+    let probe = db::read_probe_records(&conn)?;
+    let host_checks = db::read_host_check_rows(&conn)?;
+    db::checkpoint(&conn);
+    let report = list::build_report(&fingerprint, &probe, &host_checks, overrides.as_ref());
+    if report.distinct_hosts == 0 {
+        eprintln!("ftw: warning: no sites found in {}", db.display());
+    }
+    match format {
+        list::ListFormat::Table => {
+            let text = list::format_table(&report, &db.display().to_string(), site_type);
+            emit_list_report(&cli.output, &text)?;
+        }
+        list::ListFormat::Json => {
+            let mut text = list::format_json_lines(&report, site_type).join("\n");
+            if !text.is_empty() {
+                text.push('\n');
+            }
+            emit_list_report(&cli.output, &text)?;
+            eprintln!(
+                "ftw: list: {} (lists overlap; counts can sum to more than distinct hosts)",
+                list::summary_counts(&report)
+            );
+        }
+    }
     Ok(())
 }
 

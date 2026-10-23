@@ -395,7 +395,7 @@ fn stack_from_cookie(name: &str) -> Option<&'static str> {
 
 /// Best-effort stack vote from free text (Server / X-Powered-By /
 /// X-Generator / generator meta). `None` means no named stack.
-fn stack_from_text(text: &str) -> Option<&'static str> {
+pub(crate) fn stack_from_text(text: &str) -> Option<&'static str> {
     let lowered = text.to_lowercase();
     if lowered.contains("wordpress") {
         Some("wordpress")

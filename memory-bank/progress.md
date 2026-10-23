@@ -97,7 +97,18 @@
   intentionally matches the repo's existing style instead. Not a gate
   failure (`build` + `clippy -D warnings` are the gates, both clean).
 
-## Roadmap
+## Roadmap (newest: `ftw list` done, uncommitted)
+- Done: `ftw list` offline reporting subcommand (`src/list.rs`, `db.rs`
+  read helpers, `[list]` config section, `tests/list.rs`): three overlapping
+  lists from the master database (PHP via the shared cve-check gate, apps
+  via fingerprint wordpress/php_apps + probe generator/meta, vulnerable on
+  verdict `vulnerable` only), host/IP dedup preferring 443, table + JSONL
+  (`category` per entry) + `--output`, `--type` filter, `--cve` override
+  file, JSON shape documented in help. Build/clippy clean, 148/148 tests
+  green (122 unit + 26 CLI incl. 18 pre-existing unchanged). Left
+  uncommitted for review; not pushed.
+
+## Roadmap (older)
 - Done: Phase 2 implementation, tests, live loopback scan→probe smoke test,
   tech fingerprinting, HEAD-first optimization (all committed and pushed),
   tag-triggered release workflow. Release-workflow glibc fix (Linux .debs
