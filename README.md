@@ -33,8 +33,8 @@ Five subcommands, one binary, one SQLite database (`ftw.db` by default)
 fingerprinting tech: `probe` (single-pass remote web probe) plus
 `host-check` (authoritative on-host PHP patch record over SSH):
 
-```
-                    +-----------------+
+```sql
++-----------------+
                     | targets.yml     |   your OWN ranges, and nothing else
                     |  10.66.66.0/24  |
                     +--------+--------+
@@ -108,7 +108,7 @@ ftw scan --input targets.yml --ports 80,443 --db ftw.db
 ```
 
 | flag | default | meaning |
-|------|---------|---------|
+| --- | --- | --- |
 | `--input` | — (required) | YAML file with your authorized CIDRs / IPs |
 | `--ports` | `80,443` | comma-separated ports to knock on |
 | `--concurrency` | `500` | max probes in flight |
@@ -133,7 +133,7 @@ ftw fingerprint --db ftw.db --scheme auto --fetch-mode get
 ```
 
 | flag | default | meaning |
-|------|---------|---------|
+| --- | --- | --- |
 | `--concurrency` | `100` | max requests in flight |
 | `--timeout` | `5` | seconds per attempt |
 | `--scheme` | `auto` | `auto` (HTTPS first, HTTP fallback), `http`, or `https` |
@@ -176,7 +176,7 @@ ftw crawl --db ftw.db --max-depth 3 --requests-per-minute 60
 ```
 
 | flag | default | meaning |
-|------|---------|---------|
+| --- | --- | --- |
 | `--concurrency` | `100` | max fetches in flight |
 | `--timeout` | `5` | seconds per fetch |
 | `--max-depth` | `-1` | max URL depth from host root (`/` = 1); `-1` = no limit |
@@ -202,25 +202,38 @@ re-probed, the targets file is never re-expanded. Scheme is fixed by port:
 443 → `https`, everything else → `http`. Exactly one pass per open port,
 no 404 probing, no OPTIONS, no HEAD-vs-GET games, no ETag differentials:
 
-* One `GET /` with the configured timeout; at most `--body-cap` bytes
-  (default 32 KiB) are read. Full pages are never downloaded.
-* From that single response: final URL after redirects, HTTP status,
-  `Server`, `Set-Cookie` **names only** (values never stored),
-  `X-Generator`, `Via`, page `<title>`, `<meta name="generator">`, and
-  script/style URLs whose paths indicate a stack (`wp-content`,
-  `wp-includes`, theme/plugin paths, ...).
-* TLS (`https` only): peer certificate CN, SAN list, issuer, and not-after
-  date, captured from the handshake in the same pass. No separate TLS probe.
-* `GET /favicon.ico`: on a 200 the SHA-256 hash of the bytes is stored;
-  the binary itself is never stored.
-* `GET /robots.txt` and `GET /sitemap.xml`, capped at 16 KiB each:
-  presence, status, and truncated snippet. Sitemap URLs are not followed.
-* Confidence is a count of independent agreeing signals — `high` (3+),
-  `medium` (2), `low` (1), `none` (0). One header is never proof.
-* Patch status is NEVER inferred from a remote version string: any remote
-  version is a hint only and `patch_status` stays `unknown_from_remote`
-  unless a `ftw host-check` summary merged by host says otherwise
-  (`authoritative_host_check`).
+- One `GET /` with the configured timeout; at most `--body-cap` bytes
+
+(default 32 KiB) are read. Full pages are never downloaded.
+
+- From that single response: final URL after redirects, HTTP status,
+
+`Server`, `Set-Cookie` **names only** (values never stored),
+`X-Generator`, `Via`, page `<title>`, `<meta name="generator">`, and
+script/style URLs whose paths indicate a stack (`wp-content`,
+`wp-includes`, theme/plugin paths, ...).
+
+- TLS (`https` only): peer certificate CN, SAN list, issuer, and not-after
+
+date, captured from the handshake in the same pass. No separate TLS probe.
+
+- `GET /favicon.ico`: on a 200 the SHA-256 hash of the bytes is stored;
+
+the binary itself is never stored.
+
+- `GET /robots.txt` and `GET /sitemap.xml`, capped at 16 KiB each:
+
+presence, status, and truncated snippet. Sitemap URLs are not followed.
+
+- Confidence is a count of independent agreeing signals — `high` (3+),
+
+`medium` (2), `low` (1), `none` (0). One header is never proof.
+
+- Patch status is NEVER inferred from a remote version string: any remote
+
+version is a hint only and `patch_status` stays `unknown_from_remote`
+unless a `ftw host-check` summary merged by host says otherwise
+(`authoritative_host_check`).
 
 Each record streams to stdout as one JSON object per line AND lands in
 `probe_results` (`(host, port)` primary key, full record as JSON). The
@@ -232,7 +245,7 @@ ftw probe --db ftw.db --host-check host-check.jsonl
 ```
 
 | flag | default | meaning |
-|------|---------|---------|
+| --- | --- | --- |
 | `--concurrency` | `100` | max probes in flight |
 | `--timeout` | `2` | seconds per request |
 | `--insecure` | off | accept invalid certs — your OWN self-signed hosts only |
@@ -271,7 +284,7 @@ Each record streams to stdout as one JSON object per line AND lands in
 `authoritative_host_check`.
 
 | flag | default | meaning |
-|------|---------|---------|
+| --- | --- | --- |
 | `--concurrency` | `16` | max SSH sessions in flight |
 | `--timeout` | `15` | seconds per host |
 | `--db` / `--config` | `ftw.db` | database file / config file (see 0x08) |
@@ -306,7 +319,7 @@ The stderr summary prints verdict counts plus checked vs not-applicable
 totals.
 
 | flag | default | meaning |
-|------|---------|---------|
+| --- | --- | --- |
 | `--probe` | — | probe JSONL file |
 | `--fingerprint` | — | fingerprint JSONL file (at least one input required) |
 | `--host-check` | — | host-check JSONL file (authoritative versions, backport proof) |
@@ -368,7 +381,7 @@ Set only what you want — unset options fall through, never reset to zero.
 With `--verbose`, every run prints its resolved effective config to stderr
 first, one line per option with its source:
 
-```
+```yaml
 config: crawl.requests_per_minute = 60 (config)
 config: crawl.max_pages = 1000 (default)
 config: crawl.concurrency = 20 (cli)
@@ -403,7 +416,62 @@ sqlite3 ftw.db "SELECT host, php_version FROM host_check_results;"
 `-q` silences everything but errors and the stderr summary; `-v` narrates
 every event plus the effective config. Stdout stays parseable either way.
 
-# 0x0A // GREETZ & LICENSE
+# 0x0A // THE MATH: WHY YOU DON'T GET A MONTH TO PATCH
+
+Fingerprinting one of your own hosts is cheap. Fingerprinting the whole
+internet is not. That's the whole caution, in numbers.
+
+The formula, best-case, no retries, no rate limits, no CPU bottleneck,
+100% of the link used for this and nothing else:
+
+```css
+time = 2^32 addresses x bytes per host x 8 bits / bandwidth
+```
+
+Real life is slower than this. These are floors, not promises.
+
+At 1 Gbps, for all 4,294,967,296 IPv4 addresses:
+
+| what you do per host | bytes per host | total transferred | best-case time |
+| --- | --- | --- | --- |
+| SYN probe only (Detect All HTTP/HTTPS Servers) | ~60 | ~2.1 Tb | ~34 minutes |
+| HEAD / headers only (Detects Most PHP Servers) | ~500 | ~17 Tb | ~4.8 hours |
+| FTW fingerprint, 8 KiB body cap (Detects More PHP Servers) | ~8,192 | ~281 Tb | ~3.3 days |
+| FTW probe, 32 KiB body cap (Detects More PHP Applications) | ~32,768 | ~1,126 Tb | ~13.0 days |
+| Full probe pass, ~64 KiB [GET + favicon + robots + sitemap caps] (Detects Most PHP Servers) | ~65,536 | ~2,252 Tb | ~26.1 days |
+
+At 10 Gbps, divide everything by 10: SYN in ~3.4 minutes, headers in
+~29 minutes, fingerprint in ~7.8 hours, full probe in ~2.6 days.
+That's where the 2.6 shows up. 2.6 days at 10 Gbps, 26 days at 1 Gbps,
+same 64 KiB pass, just a fatter pipe.
+
+The ladder is the point. Going from a 60-byte SYN to a 64 KiB full
+probe is ~1,000x more data per host, so the job goes from minutes to
+weeks. An attacker doesn't need the full probe to find you. SYN finds
+open 80/443 in minutes to hours. Headers confirm PHP in hours. A full
+fingerprint confirms the version in days.
+
+PHP2Shell is why that matters. Patches landed October 21, 2026, and
+exploitation attempts were already in the wild within hours, millions
+of them reported. Your patch window is hours to days, not "next sprint."
+Config tweaks and WAF rules buy time, they are not a patch. And a patch
+on disk is not a patch in memory: restart FPM/Apache, or the old workers
+keep running the old code.
+
+Now flip it around, because this is the part with no excuse left in it:
+
+```css
+100 hosts x 64 KiB = 6.4 MB
+```
+
+At 1 Gbps, that's ~0.05 seconds of bandwidth. With handshakes and
+timeouts, checking your own 100 is still seconds to minutes, not days.
+Scanning the whole internet takes weeks. Scanning *yours* takes an
+afternoon coffee. So scan yours, patch yours, restart yours, re-run
+`ftw cve-check`, and do it religiously. The internet will find the
+unpatched ones long before you get around to them if you don't.
+
+# 0x0B // GREETZ & LICENSE
 
 Greetz fly out to every sysadmin who ever left port 80 open on a Friday
 afternoon. You know who you are.
