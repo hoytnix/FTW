@@ -4,9 +4,11 @@
 - `cargo build` clean, 0 warnings.
 - `cargo clippy --all-targets -- -D warnings` clean (rustup stable 1.99.1
   toolchain installed 2026-10-23 to run the gate; clippy 0.1.99).
-- `cargo test` 30/30 green (22 pre-existing: 4 Phase 1 + 12 probe + 6 tech;
-  8 new fetch-mode: invalid value, default-is-get, single-GET, 2 head,
-  union-both, both-405 fallback, head-405 error). HEAD-first auto-skip removed.
+- `cargo test` 39/39 green (34 unit: 30 pre-existing + 4 new output
+  flush/verbose-format tests; 5 new CLI in `tests/live_output.rs`: scan
+  stdout==file, probe verbose stderr, scan quiet, probe quiet, verbose/quiet
+  conflict). Scan/probe logic, flags (apart from `--verbose`/`--quiet`),
+  and output formats unchanged.
 
 ## Completed modules
 - `src/targets.rs` (YAML map/sequence parse, bare-IP fallback, aggregate dedup,

@@ -37,22 +37,55 @@ impl fmt::Display for PortStatus {
 }
 
 /// Outcome of probing one `(ip, port)` pair.
+///
+/// `reason` is the human classification reason used for verbose output only:
+/// `"open"`, `"connection refused"`, or for filtered the underlying error
+/// kind (`"timeout"`, `"host unreachable"`, `"network unreachable"`,
+/// `"permission denied"`, or `"other"`). The output file format is unchanged
+/// (`<ip>:<port> <status>`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScanResult {
     pub ip: IpAddr,
     pub port: u16,
     pub status: PortStatus,
+    pub reason: &'static str,
+}
+
+/// Map a failed-connect I/O error to its verbose reason string.
+fn filtered_reason(err: &io::Error) -> &'static str {
+    match err.kind() {
+        io::ErrorKind::TimedOut => "timeout",
+        io::ErrorKind::HostUnreachable => "host unreachable",
+        io::ErrorKind::NetworkUnreachable => "network unreachable",
+        io::ErrorKind::PermissionDenied => "permission denied",
+        _ => "other",
+    }
+}
+
+/// Probe one port with its classification reason: connect wins → open,
+/// refused → closed, timeout (or any other network error) → filtered.
+/// The classification matches [`probe`] exactly; only the reason is added.
+pub async fn probe_with_reason(
+    ip: IpAddr,
+    port: u16,
+    timeout: Duration,
+) -> (PortStatus, &'static str) {
+    let addr = SocketAddr::new(ip, port);
+    match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
+        Ok(Ok(_)) => (PortStatus::Open, "open"),
+        Ok(Err(err)) if err.kind() == io::ErrorKind::ConnectionRefused => {
+            (PortStatus::Closed, "connection refused")
+        }
+        Ok(Err(err)) => (PortStatus::Filtered, filtered_reason(&err)),
+        Err(_) => (PortStatus::Filtered, "timeout"),
+    }
 }
 
 /// Probe one port: connect wins → open, refused → closed, timeout (or any
 /// other network error) → filtered.
+#[allow(dead_code)]
 pub async fn probe(ip: IpAddr, port: u16, timeout: Duration) -> PortStatus {
-    let addr = SocketAddr::new(ip, port);
-    match tokio::time::timeout(timeout, TcpStream::connect(addr)).await {
-        Ok(Ok(_)) => PortStatus::Open,
-        Ok(Err(err)) if err.kind() == io::ErrorKind::ConnectionRefused => PortStatus::Closed,
-        Ok(Err(_)) | Err(_) => PortStatus::Filtered,
-    }
+    probe_with_reason(ip, port, timeout).await.0
 }
 
 /// Scan every address × port, sending each result to `tx`.
@@ -77,9 +110,9 @@ pub async fn scan(
                 .expect("scan semaphore never closes while scanning");
             let tx = tx.clone();
             tokio::spawn(async move {
-                let status = probe(ip, port, timeout).await;
+                let (status, reason) = probe_with_reason(ip, port, timeout).await;
                 drop(permit);
-                let _ = tx.send(ScanResult { ip, port, status }).await;
+                let _ = tx.send(ScanResult { ip, port, status, reason }).await;
             });
         }
     }

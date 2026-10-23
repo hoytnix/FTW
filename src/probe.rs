@@ -753,10 +753,23 @@ pub async fn probe_target(
 /// producer loop BEFORE `tokio::spawn`, results travel over a bounded mpsc
 /// channel to a single writer task, and records stream out as they arrive —
 /// the whole run is never buffered.
+#[allow(dead_code)]
 pub async fn run(
     config: &ProbeConfig,
     scan_output: &Path,
     output_path: PathBuf,
+) -> Result<ProbeStats, Box<dyn std::error::Error + Send + Sync>> {
+    run_with_options(config, scan_output, output_path, output::OutputOptions::default()).await
+}
+
+/// Same as [`run`], with live-output options for the single writer task.
+/// The writer remains the only place that prints per-event output; probe
+/// tasks never print directly.
+pub async fn run_with_options(
+    config: &ProbeConfig,
+    scan_output: &Path,
+    output_path: PathBuf,
+    options: output::OutputOptions,
 ) -> Result<ProbeStats, Box<dyn std::error::Error + Send + Sync>> {
     let targets = parse_scan_output(scan_output)?;
     if targets.is_empty() {
@@ -765,7 +778,8 @@ pub async fn run(
     let client = build_client(config)?;
     eprintln!("ftw: probing {} open host:port targets", targets.len());
     let (tx, rx) = mpsc::channel::<ProbeRecord>(CHANNEL_CAPACITY);
-    let writer = tokio::spawn(output::run_probe_writer(rx, output_path));
+    let writer =
+        tokio::spawn(async move { output::run_probe_writer_with_options(rx, output_path, options).await });
     let semaphore = Arc::new(Semaphore::new(config.concurrency.max(1)));
     for (ip, port) in targets {
         let permit = semaphore

@@ -54,6 +54,15 @@ struct ScanArgs {
     /// File to stream results to
     #[arg(short, long, value_name = "FILE")]
     output: PathBuf,
+
+    /// Print one human-readable stderr line per event (elapsed + detail)
+    #[arg(short, long, conflicts_with = "quiet")]
+    verbose: bool,
+
+    /// Print nothing to the terminal during the run except errors and the
+    /// final summary to stderr (output file still written + flushed per event)
+    #[arg(short, long, conflicts_with = "verbose")]
+    quiet: bool,
 }
 
 /// Phase 2 probe flags.
@@ -94,6 +103,15 @@ struct ProbeArgs {
     /// Which HTTP method(s) to send per scheme attempt
     #[arg(long, value_enum, default_value_t = probe::FetchMode::Get)]
     fetch_mode: probe::FetchMode,
+
+    /// Print one human-readable stderr line per event (elapsed + detail)
+    #[arg(short, long, conflicts_with = "quiet")]
+    verbose: bool,
+
+    /// Print nothing to the terminal during the run except errors and the
+    /// final summary to stderr (output file still written + flushed per event)
+    #[arg(short, long, conflicts_with = "verbose")]
+    quiet: bool,
 }
 
 const CHANNEL_CAPACITY: usize = 1024;
@@ -125,8 +143,10 @@ async fn run_scan(cli: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send 
         targets.net_count(),
         cli.ports.len()
     );
+    let options = output::OutputOptions::new(cli.verbose, cli.quiet);
     let (tx, rx) = mpsc::channel::<ScanResult>(CHANNEL_CAPACITY);
-    let writer = tokio::spawn(async move { output::run_writer(rx, cli.output).await });
+    let writer =
+        tokio::spawn(async move { output::run_writer_with_options(rx, cli.output, options).await });
     scanner::scan(
         &targets,
         &cli.ports,
@@ -137,7 +157,16 @@ async fn run_scan(cli: ScanArgs) -> Result<(), Box<dyn std::error::Error + Send 
     .await;
     // `scan` returns after spawning every probe; each task holds a `tx`
     // clone, so the writer finishes only after all results are delivered.
-    writer.await??;
+    let stats = writer.await??;
+    eprintln!(
+        "ftw: scanned {} addresses across {} networks × {} ports: {} open, {} closed, {} filtered",
+        targets.address_count(),
+        targets.net_count(),
+        cli.ports.len(),
+        stats.open,
+        stats.closed,
+        stats.filtered,
+    );
     Ok(())
 }
 
@@ -154,7 +183,8 @@ async fn run_probe(cli: ProbeArgs) -> Result<(), Box<dyn std::error::Error + Sen
         body_cap: cli.body_cap,
         fetch_mode: cli.fetch_mode,
     };
-    let stats = probe::run(&config, &cli.scan_output, cli.output).await?;
+    let options = output::OutputOptions::new(cli.verbose, cli.quiet);
+    let stats = probe::run_with_options(&config, &cli.scan_output, cli.output, options).await?;
     eprintln!(
         "ftw: probed {} targets: {} http, {} tls errors, {} connect errors, {} timeouts, {} other errors; php detected on {}, not detected on {}",
         stats.total,

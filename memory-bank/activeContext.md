@@ -33,7 +33,12 @@ under `scan` subcommand).
    deb/nsis/dmg via cargo-packager) plus minimal packager metadata in
    `Cargo.toml` (identifier `com.tehwiz.ftw`); YAML/manifest/build/clippy/
    test all verified locally. Changes left uncommitted.
-8. Sync this file + progress.md; leave changes uncommitted for review.
+8. Live-output improvement applied and verified: `--verbose`/`--quiet`
+   (`-v`/`-q`) on both subcommands, writer-only stdout duplication with
+   flush-per-event,
+   stderr verbose lines + summaries, `cargo build` / clippy clean,
+   `cargo test` 39/39 green (34 unit + 5 new CLI). Changes left uncommitted.
+9. Sync this file + progress.md; leave changes uncommitted for review.
 
 ## Recent state changes
 - 2026-10-23: added hacker-zine README.md + Kopimi LICENSE; banner swapped
