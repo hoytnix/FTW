@@ -13,6 +13,11 @@
 //! the exact phrases the spec allows: `"Powered by phpBB"` and
 //! `"Drupal.settings"` in the preview text.
 //!
+//! `Link` response headers are parsed into the same `(href, rel)` shape as
+//! HTML `<link>` tags, so header signals count whether they arrive on HEAD
+//! or on GET. `head_identifies_app` reports when HEAD headers alone
+//! definitively identify the application and the GET can be skipped.
+//!
 //! Known limitations (by design, not bugs):
 //! - Only the first [`MAX_PREVIEW_BYTES`] (64 KiB) bytes of a body are
 //!   fingerprinted; larger pages are not fully fetched.
@@ -73,8 +78,13 @@ pub fn fingerprint_tech(
     }
     let title = page_title(&document);
 
+    // Header `Link` entries feed the WordPress check only, so the existing
+    // `wp-json` matching applies unchanged to HEAD and GET headers alike.
+    // Tailwind and src signals stay HTML-only, exactly as specified.
+    let mut wordpress_links = links.clone();
+    wordpress_links.extend(link_header_hrefs(headers));
     let (wordpress_detected, wordpress_version, wordpress_signals) =
-        wordpress(&generators, &srcs, &links);
+        wordpress(&generators, &srcs, &wordpress_links);
     let php_apps = php_apps(headers, &generators, &srcs, &title, body_preview, &document);
     let (tailwind_detected, tailwind_confidence, tailwind_signals) =
         tailwind(&links, &script_srcs, &document);
@@ -122,6 +132,81 @@ fn link_hrefs(document: &Html) -> Vec<(String, String)> {
         }
     }
     out
+}
+
+/// `(href, rel)` of every `Link` response header entry, in the same shape as
+/// [`link_hrefs`], so the WordPress `wp-json` match applies to headers from
+/// HEAD or GET alike. Segments are split on commas only; no regex is used.
+fn link_header_hrefs(headers: &HeaderMap) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    for value in headers.get_all("link").iter() {
+        let Ok(text) = value.to_str() else {
+            continue;
+        };
+        for segment in text.split(',') {
+            let Some(uri) = segment
+                .split('<')
+                .nth(1)
+                .and_then(|rest| rest.split('>').next())
+            else {
+                continue;
+            };
+            let uri = uri.trim();
+            if uri.is_empty() {
+                continue;
+            }
+            out.push((uri.to_string(), parse_link_rel(segment).unwrap_or_default()));
+        }
+    }
+    out
+}
+
+/// Parse the `rel` parameter out of one `Link` link-value segment, handling
+/// `rel="https://api.w.org/"` and bare `rel=preload` forms. Returns `None`
+/// when the segment carries no `rel` parameter.
+fn parse_link_rel(segment: &str) -> Option<String> {
+    let mut rest = segment;
+    while let Some(index) = rest.find("rel") {
+        let before_ok = index == 0 || matches!(rest.as_bytes()[index - 1], b';' | b' ' | b'\t');
+        let after = rest[index + 3..].trim_start();
+        rest = &rest[index + 3..];
+        if !before_ok {
+            continue;
+        }
+        let Some(value) = after.strip_prefix('=') else {
+            continue;
+        };
+        let value = value.trim_start();
+        if let Some(quoted) = value.strip_prefix('"') {
+            let end = quoted.find('"')?;
+            return Some(quoted[..end].to_string());
+        }
+        let end = value.find([';', ' ', '\t']).unwrap_or(value.len());
+        if end == 0 {
+            continue;
+        }
+        return Some(value[..end].to_string());
+    }
+    None
+}
+
+/// True when HEAD headers alone definitively identify the application, so
+/// the GET can be skipped: a `Link` header for `/wp-json/` with rel
+/// `https://api.w.org/` (WordPress), or any `X-Magento-*` header (Magento).
+/// Keep in sync with the `wp-json` match in [`wordpress`] and the
+/// `x-magento-header` match in [`php_apps`]. PHP-only headers
+/// (`X-Powered-By`, PHPSESSID) are NOT sufficient: application and Tailwind
+/// signals live in the HTML, so those still require the GET.
+pub fn head_identifies_app(headers: &HeaderMap) -> bool {
+    if headers
+        .keys()
+        .any(|name| name.as_str().to_lowercase().starts_with("x-magento-"))
+    {
+        return true;
+    }
+    link_header_hrefs(headers)
+        .iter()
+        .any(|(href, rel)| rel == "https://api.w.org/" && href.contains("/wp-json/"))
 }
 
 /// `attr` of every `tag` element carrying it (e.g. `script`/`src`).
@@ -522,6 +607,31 @@ mod tests {
         assert!(tech.php_apps.is_empty());
         assert!(!tech.tailwind_detected);
         assert_eq!(tech.tailwind_confidence, "none");
+    }
+
+    #[test]
+    fn link_header_wp_json_identifies_wordpress_without_body() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            "link",
+            "<https://example.com/wp-json/>; rel=\"https://api.w.org/\""
+                .parse()
+                .expect("link header"),
+        );
+        assert!(head_identifies_app(&headers));
+        let tech = fingerprint_tech(None, &headers, "http://127.0.0.1/", "");
+        assert!(tech.wordpress_detected);
+        assert!(tech.wordpress_signals.contains(&"wp-json".to_string()));
+        assert!(tech.php_apps.is_empty());
+    }
+
+    #[test]
+    fn php_only_headers_do_not_identify_app() {
+        let mut headers = HeaderMap::new();
+        headers.insert("x-powered-by", "PHP/8.2.0".parse().expect("powered-by"));
+        assert!(!head_identifies_app(&headers));
+        let tech = fingerprint_tech(None, &headers, "http://127.0.0.1/", "");
+        assert!(!tech.wordpress_detected);
     }
 
     #[test]

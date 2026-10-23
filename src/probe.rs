@@ -5,14 +5,21 @@
 //! ports are never re-probed, the original YAML targets file is never
 //! re-expanded, and no port absent from the scan output is ever probed.
 //!
-//! Each open host:port gets a single `GET /` per scheme attempt with a clear
-//! FTW User-Agent, redirects followed up to the configured limit, and at most
-//! `--body-cap` response bytes read (never more than the 64 KiB tech preview
-//! limit). PHP fingerprinting is passive only: response headers,
-//! `Set-Cookie` headers, and the final URL. Technology fingerprinting
-//! (`crate::tech`) additionally parses at most the first 65536 body bytes
-//! kept in memory for parsing only — never written to the output, never
-//! re-fetched, and never followed with extra requests.
+//! Each open host:port gets a HEAD-first request strategy per scheme attempt
+//! with a clear FTW User-Agent, redirects followed up to the configured
+//! limit, and at most `--body-cap` response bytes read (never more than the
+//! 64 KiB tech preview limit). A `HEAD /` is sent first: when its headers
+//! alone definitively identify the application (WordPress `Link` header or
+//! any `X-Magento-*` header), the GET is skipped (`head-only`). Otherwise
+//! the existing `GET /` follows and is parsed exactly as before
+//! (`head-then-get`); when HEAD returns 4xx/5xx or fails, one GET decides
+//! the record (`get-fallback`). Header signals from HEAD and GET are
+//! unioned; the GET result supersedes HEAD for status and final URL.
+//! PHP fingerprinting is passive only: response headers, `Set-Cookie`
+//! headers, and the final URL. Technology fingerprinting (`crate::tech`)
+//! additionally parses at most the first 65536 body bytes kept in memory for
+//! parsing only — never written to the output, never re-fetched, and never
+//! followed with extra requests.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -94,6 +101,11 @@ pub struct ProbeRecord {
     pub tailwind_detected: bool,
     pub tailwind_confidence: String,
     pub tailwind_signals: Vec<String>,
+    /// How the response was obtained: `"head-only"` (GET skipped),
+    /// `"head-then-get"` (both sent), or `"get-fallback"` (HEAD failed).
+    pub fetch_method: String,
+    /// The HEAD status code, or `None` when HEAD produced no status.
+    pub head_status: Option<u16>,
 }
 
 /// Aggregate counts for one probe run.
@@ -403,8 +415,78 @@ async fn collect_preview(mut response: reqwest::Response, cap: usize) -> String 
     String::from_utf8_lossy(&kept).into_owned()
 }
 
-/// Probe one host:port with a single `GET /` over `scheme`, following
-/// redirects and recording the final URL.
+/// Union two header sets with `primary` first, so single-value lookups
+/// (`Server`, version parse order) prefer the primary response while
+/// multi-value signals (`Set-Cookie`, `Link`, `X-Powered-By`) see both.
+fn union_headers(primary: &HeaderMap, secondary: &HeaderMap) -> HeaderMap {
+    let mut merged = primary.clone();
+    for (name, value) in secondary {
+        merged.append(name.clone(), value.clone());
+    }
+    merged
+}
+
+/// Send the single `GET /` for one scheme attempt: returns status, final
+/// URL, headers, and the body preview for parsing.
+async fn fetch_get(
+    client: &reqwest::Client,
+    url: &str,
+    body_cap: usize,
+) -> Result<(u16, String, HeaderMap, String), reqwest::Error> {
+    let response = client.get(url).send().await?;
+    let status = response.status().as_u16();
+    let final_url = response.url().to_string();
+    let headers = response.headers().clone();
+    // Observe the content length if the header is present; the body itself
+    // is only streamed up to the cap (and the tech preview limit) and never
+    // stored in the output record.
+    let _content_length: Option<u64> = headers
+        .get(reqwest::header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse().ok());
+    let preview = collect_preview(response, body_cap).await;
+    Ok((status, final_url, headers, preview))
+}
+
+/// Fill a success record from one response: status and final URL from this
+/// response, PHP + tech signals from `headers` (already unioned by the
+/// caller) and `preview`. The body preview is never stored.
+fn fill_success(
+    record: &mut ProbeRecord,
+    scheme: &str,
+    status: u16,
+    final_url: String,
+    headers: &HeaderMap,
+    preview: &str,
+    fetch_method: &str,
+) {
+    record.final_url = final_url.clone();
+    record.status = Some(status);
+    record.server = headers
+        .get(reqwest::header::SERVER)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+    let (detected, version, signals) = fingerprint(headers, &final_url);
+    record.tls = if scheme == "https" { "ok" } else { "n/a" }.to_string();
+    record.php_detected = detected;
+    record.php_version = version;
+    record.php_signals = signals;
+    let tech_fp = tech::fingerprint_tech(Some(status), headers, &final_url, preview);
+    record.wordpress_detected = tech_fp.wordpress_detected;
+    record.wordpress_version = tech_fp.wordpress_version;
+    record.wordpress_signals = tech_fp.wordpress_signals;
+    record.php_apps = tech_fp.php_apps;
+    record.tailwind_detected = tech_fp.tailwind_detected;
+    record.tailwind_confidence = tech_fp.tailwind_confidence;
+    record.tailwind_signals = tech_fp.tailwind_signals;
+    record.fetch_method = fetch_method.to_string();
+}
+
+/// Probe one host:port over `scheme` with a HEAD-first strategy: `HEAD /`
+/// first (same client, so same User-Agent, timeout, redirect limit, and TLS
+/// handling), then exactly one `GET /` unless HEAD headers alone identify
+/// the application or HEAD produced no usable response. One record is
+/// produced regardless of whether one request or two was sent.
 async fn attempt(
     client: &reqwest::Client,
     scheme: &str,
@@ -432,42 +514,67 @@ async fn attempt(
         tailwind_detected: false,
         tailwind_confidence: "none".to_string(),
         tailwind_signals: Vec::new(),
+        fetch_method: "get-fallback".to_string(),
+        head_status: None,
     };
-    match client.get(&attempted_url).send().await {
-        Ok(response) => {
-            let final_url = response.url().to_string();
-            let status = response.status().as_u16();
-            let headers = response.headers().clone();
-            record.final_url = final_url.clone();
-            record.status = Some(status);
-            record.server = headers
-                .get(reqwest::header::SERVER)
-                .and_then(|value| value.to_str().ok())
-                .map(str::to_owned);
-            // Observe the content length if the header is present; the body
-            // itself is only streamed up to the cap (and the tech preview
-            // limit) and never stored in the output record.
-            let _content_length: Option<u64> = headers
-                .get(reqwest::header::CONTENT_LENGTH)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse().ok());
-            let preview = collect_preview(response, body_cap).await;
-            let (detected, version, signals) = fingerprint(&headers, &final_url);
-            record.tls = if scheme == "https" { "ok" } else { "n/a" }.to_string();
-            record.php_detected = detected;
-            record.php_version = version;
-            record.php_signals = signals;
-            let tech_fp = tech::fingerprint_tech(Some(status), &headers, &final_url, &preview);
-            record.wordpress_detected = tech_fp.wordpress_detected;
-            record.wordpress_version = tech_fp.wordpress_version;
-            record.wordpress_signals = tech_fp.wordpress_signals;
-            record.php_apps = tech_fp.php_apps;
-            record.tailwind_detected = tech_fp.tailwind_detected;
-            record.tailwind_confidence = tech_fp.tailwind_confidence;
-            record.tailwind_signals = tech_fp.tailwind_signals;
+    match client.head(&attempted_url).send().await {
+        Ok(head) => {
+            let head_status = head.status().as_u16();
+            let head_url = head.url().to_string();
+            let head_headers = head.headers().clone();
+            // A HEAD response carries no body: only its status, final URL,
+            // and headers are kept.
+            record.head_status = Some(head_status);
+            if !(400..600).contains(&head_status) && tech::head_identifies_app(&head_headers) {
+                fill_success(
+                    &mut record,
+                    scheme,
+                    head_status,
+                    head_url,
+                    &head_headers,
+                    "",
+                    "head-only",
+                );
+            } else {
+                let head_failed = (400..600).contains(&head_status);
+                match fetch_get(client, &attempted_url, body_cap).await {
+                    Ok((status, final_url, get_headers, preview)) => {
+                        let merged = union_headers(&get_headers, &head_headers);
+                        fill_success(
+                            &mut record,
+                            scheme,
+                            status,
+                            final_url,
+                            &merged,
+                            &preview,
+                            if head_failed { "get-fallback" } else { "head-then-get" },
+                        );
+                    }
+                    Err(err) => {
+                        record.error = Some(classify_error(&err).to_string());
+                    }
+                }
+            }
         }
-        Err(err) => {
-            record.error = Some(classify_error(&err).to_string());
+        Err(_) => {
+            // HEAD produced no response at all: one GET decides the record,
+            // and a GET failure is classified exactly as before.
+            match fetch_get(client, &attempted_url, body_cap).await {
+                Ok((status, final_url, headers, preview)) => {
+                    fill_success(
+                        &mut record,
+                        scheme,
+                        status,
+                        final_url,
+                        &headers,
+                        &preview,
+                        "get-fallback",
+                    );
+                }
+                Err(err) => {
+                    record.error = Some(classify_error(&err).to_string());
+                }
+            }
         }
     }
     record
@@ -955,5 +1062,273 @@ mod tests {
         let signals = record["tailwind_signals"].as_array().expect("signals array");
         assert!(signals.contains(&serde_json::json!("tailwind-cdn")));
         assert_only_root_request(&paths);
+    }
+
+    fn reason_phrase(status: u16) -> &'static str {
+        match status {
+            200 => "OK",
+            405 => "Method Not Allowed",
+            501 => "Not Implemented",
+            _ => "Status",
+        }
+    }
+
+    /// Origin server that routes by method and records every
+    /// `(method, path)`: HEAD answers with a fixed status/headers and no
+    /// body; any other method answers 200 with fixed headers/body. Proves
+    /// the HEAD-first request pattern without extra paths.
+    async fn spawn_method_server(
+        head_status: u16,
+        head_headers: Vec<(String, String)>,
+        get_headers: Vec<(String, String)>,
+        get_body: &'static str,
+    ) -> (
+        SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<(String, String)>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind method server");
+        let addr = listener.local_addr().expect("method server addr");
+        let log = std::sync::Arc::new(std::sync::Mutex::new(Vec::<(String, String)>::new()));
+        let seen = log.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let seen = seen.clone();
+                let head_headers = head_headers.clone();
+                let get_headers = get_headers.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf)).await;
+                    let text = String::from_utf8_lossy(&buf).into_owned();
+                    let (method, path) = text
+                        .lines()
+                        .next()
+                        .and_then(|line| {
+                            let mut parts = line.split_whitespace();
+                            Some((parts.next()?.to_string(), parts.next()?.to_string()))
+                        })
+                        .unwrap_or_default();
+                    if !method.is_empty() {
+                        seen.lock().expect("method log").push((method.clone(), path));
+                    }
+                    let response = if method == "HEAD" {
+                        let mut response = format!(
+                            "HTTP/1.1 {head_status} {}\r\n",
+                            reason_phrase(head_status)
+                        );
+                        for (name, value) in &head_headers {
+                            response.push_str(&format!("{name}: {value}\r\n"));
+                        }
+                        response.push_str("Content-Length: 0\r\nConnection: close\r\n\r\n");
+                        response
+                    } else {
+                        let mut response = String::from("HTTP/1.1 200 OK\r\n");
+                        for (name, value) in &get_headers {
+                            response.push_str(&format!("{name}: {value}\r\n"));
+                        }
+                        response.push_str(&format!(
+                            "Content-Length: {}\r\nConnection: close\r\n\r\n{get_body}",
+                            get_body.len()
+                        ));
+                        response
+                    };
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (addr, log, handle)
+    }
+
+    async fn run_head_probe(
+        tag: String,
+        head_status: u16,
+        head_headers: Vec<(String, String)>,
+        get_headers: Vec<(String, String)>,
+        get_body: &'static str,
+    ) -> (
+        serde_json::Value,
+        Vec<(String, String)>,
+        String,
+    ) {
+        let dir = std::env::temp_dir();
+        let scan_path = dir.join(format!("{tag}.scan"));
+        let out_path = dir.join(format!("{tag}.out"));
+        let (addr, log, server) =
+            spawn_method_server(head_status, head_headers, get_headers, get_body).await;
+        std::fs::write(&scan_path, format!("127.0.0.1:{} open\n", addr.port()))
+            .expect("write fake scan output");
+        run(&test_config(Scheme::Http), &scan_path, out_path.clone())
+            .await
+            .expect("probe run");
+        server.abort();
+        let records = read_json_lines(&out_path);
+        assert_eq!(records.len(), 1);
+        let record = records.into_iter().next().expect("one record");
+        let raw = std::fs::read_to_string(&out_path).expect("read raw output");
+        let logged = log.lock().expect("method log").clone();
+        std::fs::remove_file(&scan_path).ok();
+        std::fs::remove_file(&out_path).ok();
+        (record, logged, raw)
+    }
+
+    fn assert_only_root_requests(log: &[(String, String)]) {
+        assert!(!log.is_empty(), "expected at least one request");
+        for (method, path) in log {
+            assert!(
+                method == "HEAD" || method == "GET",
+                "unexpected method {method}"
+            );
+            assert_eq!(path, "/", "unexpected path {path}");
+        }
+        for forbidden in [
+            "/wp-admin",
+            "/wp-login.php",
+            "/phpinfo.php",
+            "/readme.html",
+            "/xmlrpc.php",
+        ] {
+            assert!(
+                !log.iter().any(|(_, path)| path.contains(forbidden)),
+                "forbidden path {forbidden} requested in {log:?}"
+            );
+        }
+    }
+
+    /// HEAD `Link: <.../wp-json/>; rel="https://api.w.org/"` identifies
+    /// WordPress: the GET is skipped, exactly one HEAD to "/" is recorded.
+    #[tokio::test]
+    async fn head_only_skips_get_for_wordpress_link_header() {
+        let head_headers = vec![(
+            "Link".to_string(),
+            "<https://example.com/wp-json/>; rel=\"https://api.w.org/\"".to_string(),
+        )];
+        let get_body = "<html><head><title>Never fetched</title></head><body><p>head-body-marker</p></body></html>";
+        let (record, log, raw) = run_head_probe(
+            temp_tag("probe-headonly"),
+            200,
+            head_headers,
+            Vec::new(),
+            get_body,
+        )
+        .await;
+        assert_eq!(record["fetch_method"], "head-only");
+        assert_eq!(record["head_status"], 200);
+        assert_eq!(record["status"], 200);
+        assert!(record["error"].is_null());
+        assert_eq!(record["wordpress_detected"], true);
+        assert!(
+            record["wordpress_signals"]
+                .as_array()
+                .expect("signals")
+                .contains(&serde_json::json!("wp-json"))
+        );
+        assert_eq!(record["php_apps"], serde_json::json!([]));
+        assert_eq!(log, vec![("HEAD".to_string(), "/".to_string())]);
+        assert!(!raw.contains("head-body-marker"));
+        assert_only_root_requests(&log);
+    }
+
+    /// HEAD with no application headers still needs the GET: WordPress HTML
+    /// on GET gives `head-then-get` with exactly two recorded requests.
+    #[tokio::test]
+    async fn head_then_get_for_no_header_wordpress_html() {
+        let get_body = "<html><head><meta name=\"generator\" content=\"WordPress 6.5.2\" /><script src=\"/wp-content/themes/t/app.js\"></script></head><body><p>head-body-marker</p></body></html>";
+        let (record, log, raw) = run_head_probe(
+            temp_tag("probe-headthenget"),
+            200,
+            Vec::new(),
+            Vec::new(),
+            get_body,
+        )
+        .await;
+        assert_eq!(record["fetch_method"], "head-then-get");
+        assert_eq!(record["head_status"], 200);
+        assert_eq!(record["status"], 200);
+        assert!(record["error"].is_null());
+        assert_eq!(record["wordpress_detected"], true);
+        assert_eq!(record["wordpress_version"], "6.5.2");
+        assert_eq!(
+            log,
+            vec![
+                ("HEAD".to_string(), "/".to_string()),
+                ("GET".to_string(), "/".to_string()),
+            ]
+        );
+        assert!(!raw.contains("head-body-marker"));
+        assert_only_root_requests(&log);
+    }
+
+    /// HEAD 405 falls back to one GET: a normal record, no probe error.
+    #[tokio::test]
+    async fn get_fallback_when_head_405() {
+        let get_body = "<html><head><title>Plain</title></head><body><p>head-body-marker</p></body></html>";
+        let (record, log, raw) = run_head_probe(
+            temp_tag("probe-head405"),
+            405,
+            Vec::new(),
+            Vec::new(),
+            get_body,
+        )
+        .await;
+        assert_eq!(record["fetch_method"], "get-fallback");
+        assert_eq!(record["head_status"], 405);
+        assert_eq!(record["status"], 200);
+        assert!(record["error"].is_null());
+        assert_eq!(record["wordpress_detected"], false);
+        assert_eq!(record["php_apps"], serde_json::json!([]));
+        assert_eq!(record["tailwind_confidence"], "none");
+        assert_eq!(
+            log,
+            vec![
+                ("HEAD".to_string(), "/".to_string()),
+                ("GET".to_string(), "/".to_string()),
+            ]
+        );
+        assert!(!raw.contains("head-body-marker"));
+        assert_only_root_requests(&log);
+    }
+
+    /// HEAD `X-Powered-By: PHP/8.2.0` with no application header still needs
+    /// the GET: PHP alone never skips it.
+    #[tokio::test]
+    async fn php_header_alone_still_sends_get() {
+        let head_headers = vec![("X-Powered-By".to_string(), "PHP/8.2.0".to_string())];
+        let get_body = "<html><head><title>Plain</title></head><body><p>hi</p></body></html>";
+        let (record, log, _) = run_head_probe(
+            temp_tag("probe-phphead"),
+            200,
+            head_headers,
+            Vec::new(),
+            get_body,
+        )
+        .await;
+        assert_eq!(record["fetch_method"], "head-then-get");
+        assert_eq!(record["head_status"], 200);
+        assert!(record["error"].is_null());
+        assert_eq!(record["php_detected"], true);
+        assert_eq!(record["php_version"], "8.2.0");
+        assert!(
+            record["php_signals"]
+                .as_array()
+                .expect("signals")
+                .contains(&serde_json::json!("x-powered-by"))
+        );
+        assert_eq!(record["wordpress_detected"], false);
+        assert_eq!(
+            log,
+            vec![
+                ("HEAD".to_string(), "/".to_string()),
+                ("GET".to_string(), "/".to_string()),
+            ]
+        );
+        assert_only_root_requests(&log);
     }
 }

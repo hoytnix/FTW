@@ -4,8 +4,10 @@
 Phase 2 (`ftw probe`) built and verified: HTTP/HTTPS probing of open ports
 from Phase 1 scan output, with passive PHP fingerprinting plus additive
 technology fingerprinting (`src/tech.rs`: WordPress, 8 PHP apps, TailwindCSS
-from a 64 KiB body preview, no extra requests). Phase 1 `scan` behavior and
-output format unchanged (flags moved under `scan` subcommand).
+from a 64 KiB body preview, no extra requests), plus a HEAD-first request
+strategy (HEAD then GET only when needed; `fetch_method`/`head_status`
+fields). Phase 1 `scan` behavior and output format unchanged (flags moved
+under `scan` subcommand).
 
 ## Active work stream
 1. Restructured CLI into `scan` / `probe` subcommands (clap derive).
@@ -18,8 +20,11 @@ output format unchanged (flags moved under `scan` subcommand).
    `cargo test` 11/11 green, live loopback smoke of scan→probe.
 5. Tech fingerprinting improvement applied and verified: `cargo build` clean,
    `cargo clippy --all-targets -- -D warnings` clean, `cargo test` 20/20
-   green (11 pre-existing + 9 new tech tests). Changes left uncommitted.
-6. Sync this file + progress.md; leave changes uncommitted for review.
+   green (11 pre-existing + 9 new tech tests). Committed and pushed (888cfc4).
+6. HEAD-first optimization applied and verified: `cargo build` clean,
+   `cargo clippy --all-targets -- -D warnings` clean, `cargo test` 26/26
+   green (20 pre-existing + 6 new HEAD-first tests). Changes left uncommitted.
+7. Sync this file + progress.md; leave changes uncommitted for review.
 
 ## Recent state changes
 - 2026-10-23: added hacker-zine README.md + Kopimi LICENSE; banner swapped

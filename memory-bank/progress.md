@@ -4,8 +4,9 @@
 - `cargo build` clean, 0 warnings.
 - `cargo clippy --all-targets -- -D warnings` clean (rustup stable 1.99.1
   toolchain installed 2026-10-23 to run the gate; clippy 0.1.99).
-- `cargo test` 20/20 green (11 pre-existing: 4 Phase 1 + 7 probe; 9 new tech:
-  4 `tech.rs` unit + 5 path-logging end-to-end probe tests).
+- `cargo test` 26/26 green (20 pre-existing: 4 Phase 1 + 7 probe + 9 tech;
+  6 new HEAD-first: 2 `tech.rs` unit + 4 method-logging end-to-end probe
+  tests).
 
 ## Completed modules
 - `src/targets.rs` (YAML map/sequence parse, bare-IP fallback, aggregate dedup,
@@ -23,7 +24,11 @@
   strict `PHP/x.y.z` version parse), semaphore-gated spawn + bounded mpsc +
   single writer (Phase 1 architecture), 7 tests; extended additively with a
   64 KiB body preview (`collect_preview`) feeding `tech` fingerprinting and 5
-  path-logging end-to-end tech tests (all existing fields unchanged).
+  path-logging end-to-end tech tests (all existing fields unchanged); then
+  with a HEAD-first strategy (`HEAD /` via the same client, GET skipped only
+  on WP `Link`/`X-Magento-*` headers, GET fallback on 4xx/5xx or HEAD
+  failure, header union, `fetch_method`/`head_status` fields) and 4
+  method-logging end-to-end HEAD tests.
 - `src/tech.rs` (new): no-network technology fingerprinting of the
   already-fetched response via `scraper` (meta/link-href/script-src/img-src/
   class/title parsing; raw-text search only for exact `Powered by phpBB` and
@@ -31,7 +36,10 @@
   `wp-json` + version + `woocommerce-plugin` note), 8 PHP apps
   (Joomla/Drupal/Magento/phpBB/MediaWiki/PrestaShop/OpenCart/Moodle, versions
   from generator tags only), TailwindCSS (`tailwind-cdn`/`tailwind-link`
-  strong, `utility-classes` weak-only), 4 unit tests.
+  strong, `utility-classes` weak-only), 4 unit tests; extended with `Link`
+  response-header parsing (same `(href, rel)` shape, WordPress check only)
+  and `head_identifies_app` (WP `Link` / `X-Magento-*` skip rule), 2 more
+  unit tests.
 
 ## Known issues
 - `cargo fmt --check` under the newer 1.99 rustfmt flags style drift in
