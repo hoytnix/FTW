@@ -1,0 +1,41 @@
+[global]
+db = "ftw.db"
+
+[scan]
+concurrency = 500
+timeout = 2
+
+[fingerprint]
+concurrency = 100
+timeout = 5
+scheme = "auto"          # auto | http | https
+insecure = false
+max_redirects = 5
+body_cap = 8192
+fetch_mode = "get"       # get | head | both
+prefer_https = true
+
+[crawl]
+concurrency = 100
+timeout = 5
+max_depth = -1   # -1 = no limit; otherwise >= 1, absolute from host root
+max_pages = 1000
+body_cap = 262144
+max_redirects = 5
+insecure = false
+requests_per_minute = 0  # 0 = unlimited
+
+[crawl.rate_limits]      # per-domain overrides (canonical domains only)
+"wordpress.org" = 5
+"example.com" = 60
+
+[probe]
+concurrency = 100
+timeout = 2
+insecure = false
+body_cap = 32768
+# host_check = "host-check.jsonl"
+
+[host_check]
+concurrency = 16
+timeout = 15

@@ -1,0 +1,4 @@
+targets:
+#  - 0.0.0.0/0      # Whole Internet
+  - 127.0.0.1      # Myself (YOU!)
+  - 192.168.0.1    # My Router
