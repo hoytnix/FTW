@@ -2,6 +2,7 @@ mod output;
 mod probe;
 mod scanner;
 mod targets;
+mod tech;
 
 use std::path::PathBuf;
 use std::time::Duration;

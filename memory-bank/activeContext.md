@@ -2,8 +2,10 @@
 
 ## Current focus
 Phase 2 (`ftw probe`) built and verified: HTTP/HTTPS probing of open ports
-from Phase 1 scan output, with passive PHP fingerprinting. Phase 1 `scan`
-behavior and output format unchanged (flags moved under `scan` subcommand).
+from Phase 1 scan output, with passive PHP fingerprinting plus additive
+technology fingerprinting (`src/tech.rs`: WordPress, 8 PHP apps, TailwindCSS
+from a 64 KiB body preview, no extra requests). Phase 1 `scan` behavior and
+output format unchanged (flags moved under `scan` subcommand).
 
 ## Active work stream
 1. Restructured CLI into `scan` / `probe` subcommands (clap derive).
@@ -14,7 +16,10 @@ behavior and output format unchanged (flags moved under `scan` subcommand).
 4. Verified: `cargo build` clean, `cargo clippy --all-targets -- -D warnings`
    clean (via rustup stable 1.99.1 toolchain installed for the gate),
    `cargo test` 11/11 green, live loopback smoke of scan→probe.
-5. Sync this file + progress.md; leave changes uncommitted for review.
+5. Tech fingerprinting improvement applied and verified: `cargo build` clean,
+   `cargo clippy --all-targets -- -D warnings` clean, `cargo test` 20/20
+   green (11 pre-existing + 9 new tech tests). Changes left uncommitted.
+6. Sync this file + progress.md; leave changes uncommitted for review.
 
 ## Recent state changes
 - 2026-10-23: added hacker-zine README.md + Kopimi LICENSE; banner swapped

@@ -7,8 +7,12 @@
 //!
 //! Each open host:port gets a single `GET /` per scheme attempt with a clear
 //! FTW User-Agent, redirects followed up to the configured limit, and at most
-//! `--body-cap` response bytes read. PHP fingerprinting is passive only:
-//! response headers, `Set-Cookie` headers, and the final URL — never the body.
+//! `--body-cap` response bytes read (never more than the 64 KiB tech preview
+//! limit). PHP fingerprinting is passive only: response headers,
+//! `Set-Cookie` headers, and the final URL. Technology fingerprinting
+//! (`crate::tech`) additionally parses at most the first 65536 body bytes
+//! kept in memory for parsing only — never written to the output, never
+//! re-fetched, and never followed with extra requests.
 
 use std::collections::HashSet;
 use std::fmt;
@@ -22,6 +26,7 @@ use reqwest::redirect::Policy;
 use tokio::sync::{Semaphore, mpsc};
 
 use crate::output;
+use crate::tech;
 
 const CHANNEL_CAPACITY: usize = 1024;
 
@@ -82,6 +87,13 @@ pub struct ProbeRecord {
     pub php_detected: bool,
     pub php_version: Option<String>,
     pub php_signals: Vec<String>,
+    pub wordpress_detected: bool,
+    pub wordpress_version: Option<String>,
+    pub wordpress_signals: Vec<String>,
+    pub php_apps: Vec<tech::PhpApp>,
+    pub tailwind_detected: bool,
+    pub tailwind_confidence: String,
+    pub tailwind_signals: Vec<String>,
 }
 
 /// Aggregate counts for one probe run.
@@ -363,20 +375,32 @@ fn fingerprint(headers: &HeaderMap, final_url: &str) -> (bool, Option<String>, V
     (!signals.is_empty(), version, signals)
 }
 
-/// Read at most `cap` response body bytes, then stop. The bytes are discarded:
-/// only status, `Server`, and content-length presence are recorded.
-async fn drain_body(response: reqwest::Response, cap: usize) {
-    if cap == 0 {
-        return;
+/// Stream at most `cap` response body bytes (and never more than the tech
+/// preview limit), keeping the leading bytes as a lossy string for parsing
+/// only. The preview is discarded after fingerprinting and never written to
+/// the probe output file. Larger pages are not fully fetched: only the first
+/// 65536 bytes are fingerprinted.
+async fn collect_preview(mut response: reqwest::Response, cap: usize) -> String {
+    let limit = cap.min(tech::MAX_PREVIEW_BYTES);
+    if limit == 0 {
+        return String::new();
     }
-    let mut remaining = cap;
-    let mut response = response;
-    while let Ok(Some(chunk)) = response.chunk().await {
-        if chunk.len() >= remaining {
-            break;
+    let mut kept = Vec::with_capacity(limit.min(8192));
+    let mut remaining = limit;
+    while remaining > 0 {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let take = chunk.len().min(remaining);
+                kept.extend_from_slice(&chunk[..take]);
+                if chunk.len() >= remaining {
+                    break;
+                }
+                remaining -= chunk.len();
+            }
+            _ => break,
         }
-        remaining -= chunk.len();
     }
+    String::from_utf8_lossy(&kept).into_owned()
 }
 
 /// Probe one host:port with a single `GET /` over `scheme`, following
@@ -401,6 +425,13 @@ async fn attempt(
         php_detected: false,
         php_version: None,
         php_signals: Vec::new(),
+        wordpress_detected: false,
+        wordpress_version: None,
+        wordpress_signals: Vec::new(),
+        php_apps: Vec::new(),
+        tailwind_detected: false,
+        tailwind_confidence: "none".to_string(),
+        tailwind_signals: Vec::new(),
     };
     match client.get(&attempted_url).send().await {
         Ok(response) => {
@@ -414,17 +445,26 @@ async fn attempt(
                 .and_then(|value| value.to_str().ok())
                 .map(str::to_owned);
             // Observe the content length if the header is present; the body
-            // itself is only streamed up to the cap and never stored.
+            // itself is only streamed up to the cap (and the tech preview
+            // limit) and never stored in the output record.
             let _content_length: Option<u64> = headers
                 .get(reqwest::header::CONTENT_LENGTH)
                 .and_then(|value| value.to_str().ok())
                 .and_then(|value| value.parse().ok());
-            drain_body(response, body_cap).await;
+            let preview = collect_preview(response, body_cap).await;
             let (detected, version, signals) = fingerprint(&headers, &final_url);
             record.tls = if scheme == "https" { "ok" } else { "n/a" }.to_string();
             record.php_detected = detected;
             record.php_version = version;
             record.php_signals = signals;
+            let tech_fp = tech::fingerprint_tech(Some(status), &headers, &final_url, &preview);
+            record.wordpress_detected = tech_fp.wordpress_detected;
+            record.wordpress_version = tech_fp.wordpress_version;
+            record.wordpress_signals = tech_fp.wordpress_signals;
+            record.php_apps = tech_fp.php_apps;
+            record.tailwind_detected = tech_fp.tailwind_detected;
+            record.tailwind_confidence = tech_fp.tailwind_confidence;
+            record.tailwind_signals = tech_fp.tailwind_signals;
         }
         Err(err) => {
             record.error = Some(classify_error(&err).to_string());
@@ -753,5 +793,167 @@ mod tests {
 
         std::fs::remove_file(&scan_path).ok();
         std::fs::remove_file(&out_path).ok();
+    }
+
+    /// Test origin server that records every request path it sees, so tests
+    /// can prove probe made no request beyond the single `GET /` per scheme
+    /// attempt (never `/wp-admin`, `/wp-login.php`, `/phpinfo.php`, ...).
+    async fn spawn_path_logging_server(
+        body: &'static str,
+    ) -> (
+        SocketAddr,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind path-logging server");
+        let addr = listener.local_addr().expect("path-logging addr");
+        let paths = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let seen = paths.clone();
+        let handle = tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = match listener.accept().await {
+                    Ok(pair) => pair,
+                    Err(_) => break,
+                };
+                let seen = seen.clone();
+                tokio::spawn(async move {
+                    let mut buf = [0u8; 8192];
+                    let _ =
+                        tokio::time::timeout(Duration::from_secs(2), sock.read(&mut buf)).await;
+                    let text = String::from_utf8_lossy(&buf).into_owned();
+                    if let Some(line) = text.lines().next() {
+                        let mut parts = line.split_whitespace();
+                        if let (Some(method), Some(path)) = (parts.next(), parts.next()) {
+                            if method == "GET" {
+                                seen.lock().expect("path log").push(path.to_string());
+                            }
+                        }
+                    }
+                    let response = format!(
+                        "HTTP/1.1 200 OK\r\nServer: TestServer/1.0\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    let _ = sock.write_all(response.as_bytes()).await;
+                    let _ = sock.shutdown().await;
+                });
+            }
+        });
+        (addr, paths, handle)
+    }
+
+    fn assert_only_root_request(paths: &std::sync::Mutex<Vec<String>>) {
+        let logged = paths.lock().expect("path log").clone();
+        assert_eq!(logged, vec!["/".to_string()], "only GET / is ever requested, got: {logged:?}");
+        for forbidden in [
+            "/wp-admin",
+            "/wp-login.php",
+            "/phpinfo.php",
+            "/readme.html",
+            "/xmlrpc.php",
+        ] {
+            assert!(
+                !logged.iter().any(|path| path.contains(forbidden)),
+                "forbidden path {forbidden} was requested: {logged:?}"
+            );
+        }
+    }
+
+    async fn run_single_tech_probe(
+        tag: String,
+        body: &'static str,
+    ) -> (
+        serde_json::Value,
+        std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        String,
+    ) {
+        let dir = std::env::temp_dir();
+        let scan_path = dir.join(format!("{tag}.scan"));
+        let out_path = dir.join(format!("{tag}.out"));
+        let (addr, paths, server) = spawn_path_logging_server(body).await;
+        std::fs::write(&scan_path, format!("127.0.0.1:{} open\n", addr.port()))
+            .expect("write fake scan output");
+        run(&test_config(Scheme::Http), &scan_path, out_path.clone())
+            .await
+            .expect("probe run");
+        server.abort();
+        let records = read_json_lines(&out_path);
+        assert_eq!(records.len(), 1);
+        let record = records.into_iter().next().expect("one record");
+        let raw = std::fs::read_to_string(&out_path).expect("read raw output");
+        std::fs::remove_file(&scan_path).ok();
+        std::fs::remove_file(&out_path).ok();
+        (record, paths, raw)
+    }
+
+    /// WordPress fixture: generator `WordPress 6.5.2` plus a `/wp-content/`
+    /// script. No WooCommerce app entry is reported.
+    #[tokio::test]
+    async fn probe_detects_wordpress_with_version() {
+        let body = "<html><head><meta name=\"generator\" content=\"WordPress 6.5.2\" /><script src=\"/wp-content/themes/t/app.js\"></script></head><body>hi</body></html>";
+        let (record, paths, raw) = run_single_tech_probe(temp_tag("probe-wp"), body).await;
+        assert_eq!(record["wordpress_detected"], true);
+        assert_eq!(record["wordpress_version"], "6.5.2");
+        let signals = record["wordpress_signals"].as_array().expect("signals array");
+        assert!(signals.contains(&serde_json::json!("generator")));
+        assert!(signals.contains(&serde_json::json!("wp-content")));
+        assert_eq!(record["php_apps"], serde_json::json!([]));
+        assert!(!raw.contains("/wp-content/themes"), "body must never be written to output");
+        assert_only_root_request(&paths);
+    }
+
+    /// Joomla fixture produces the Joomla `php_apps` entry with its version.
+    #[tokio::test]
+    async fn probe_detects_joomla_app_with_version() {
+        let body = "<html><head><meta name=\"generator\" content=\"Joomla! 4.2.5\" /><script src=\"/media/system/js/core.js\"></script></head><body>hi</body></html>";
+        let (record, paths, _) = run_single_tech_probe(temp_tag("probe-joomla"), body).await;
+        assert_eq!(record["wordpress_detected"], false);
+        let apps = record["php_apps"].as_array().expect("php_apps array");
+        let joomla = apps.iter().find(|app| app["name"] == "Joomla").expect("Joomla entry");
+        assert_eq!(joomla["version"], "4.2.5");
+        assert!(!joomla["signals"].as_array().expect("signals").is_empty());
+        assert_only_root_request(&paths);
+    }
+
+    /// Drupal fixture produces the Drupal `php_apps` entry with its version.
+    #[tokio::test]
+    async fn probe_detects_drupal_app_with_version() {
+        let body = "<html><head><meta name=\"generator\" content=\"Drupal 10\" /><script src=\"/sites/default/files/js/app.js\"></script></head><body>hi</body></html>";
+        let (record, paths, _) = run_single_tech_probe(temp_tag("probe-drupal"), body).await;
+        assert_eq!(record["wordpress_detected"], false);
+        let apps = record["php_apps"].as_array().expect("php_apps array");
+        let drupal = apps.iter().find(|app| app["name"] == "Drupal").expect("Drupal entry");
+        assert_eq!(drupal["version"], "10");
+        assert!(!drupal["signals"].as_array().expect("signals").is_empty());
+        assert_only_root_request(&paths);
+    }
+
+    /// Plain HTML with no markers: no WordPress, no apps, Tailwind `"none"`.
+    #[tokio::test]
+    async fn probe_plain_html_has_no_tech_signals() {
+        let body = "<html><head><title>Plain</title></head><body><p>hello</p></body></html>";
+        let (record, paths, raw) = run_single_tech_probe(temp_tag("probe-plain"), body).await;
+        assert_eq!(record["wordpress_detected"], false);
+        assert!(record["wordpress_version"].is_null());
+        assert_eq!(record["wordpress_signals"], serde_json::json!([]));
+        assert_eq!(record["php_apps"], serde_json::json!([]));
+        assert_eq!(record["tailwind_detected"], false);
+        assert_eq!(record["tailwind_confidence"], "none");
+        assert_eq!(record["tailwind_signals"], serde_json::json!([]));
+        assert!(!raw.contains("<p>"), "body must never be written to output");
+        assert_only_root_request(&paths);
+    }
+
+    /// Tailwind CDN script is a strong signal: detected with confidence strong.
+    #[tokio::test]
+    async fn probe_detects_tailwind_cdn_as_strong() {
+        let body = "<html><head><script src=\"https://cdn.tailwindcss.com\"></script></head><body><div class=\"flex items-center justify-center\">hi</div></body></html>";
+        let (record, paths, _) = run_single_tech_probe(temp_tag("probe-tw"), body).await;
+        assert_eq!(record["tailwind_detected"], true);
+        assert_eq!(record["tailwind_confidence"], "strong");
+        let signals = record["tailwind_signals"].as_array().expect("signals array");
+        assert!(signals.contains(&serde_json::json!("tailwind-cdn")));
+        assert_only_root_request(&paths);
     }
 }
