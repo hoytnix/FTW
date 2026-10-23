@@ -1,0 +1,15 @@
+[package]
+name = "ftw"
+version = "0.1.0"
+edition = "2021"
+
+[[bin]]
+name = "ftw"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = ["full"] }
+clap = { version = "4", features = ["derive"] }
+ipnet = "2"
+serde = { version = "1", features = ["derive"] }
+serde_yml = "0.0"
