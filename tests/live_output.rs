@@ -43,10 +43,43 @@ fn db_text_rows(db_path: &std::path::Path, sql: &str) -> Vec<String> {
         .expect("collect rows")
 }
 
+fn db_int_rows(db_path: &std::path::Path, sql: &str) -> Vec<i64> {
+    let conn = rusqlite::Connection::open(db_path).expect("open db");
+    let mut stmt = conn.prepare(sql).expect("prepare query");
+    stmt.query_map([], |row| row.get(0))
+        .expect("map rows")
+        .collect::<Result<_, _>>()
+        .expect("collect rows")
+}
+
 fn db_count(db_path: &std::path::Path, table: &str) -> i64 {
     let conn = rusqlite::Connection::open(db_path).expect("open db");
     conn.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))
         .expect("count rows")
+}
+
+/// Seed `scan_results` with open rows exactly as a prior `ftw scan --db` run
+/// would have left them (fingerprint's own `db::open` completes the schema).
+fn seed_open_ports(db_path: &std::path::Path, ports: &[u16]) {
+    let conn = rusqlite::Connection::open(db_path).expect("open db");
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS scan_results (
+           ip           TEXT NOT NULL,
+           port         INTEGER NOT NULL,
+           status       TEXT NOT NULL,
+           scanned_at   TEXT NOT NULL,
+           PRIMARY KEY (ip, port)
+        );",
+    )
+    .expect("create scan table");
+    for port in ports {
+        conn.execute(
+            "INSERT OR REPLACE INTO scan_results (ip, port, status, scanned_at)
+             VALUES ('127.0.0.1', ?1, 'open', '2026-01-01T00:00:00Z')",
+            rusqlite::params![port],
+        )
+        .expect("seed open row");
+    }
 }
 
 /// A port nothing listens on (bind-then-drop, loopback only).
@@ -659,5 +692,312 @@ fn crawl_end_to_end_visits_chain_and_skips_external() {
     );
 
     std::fs::remove_file(&yaml_path).ok();
+    remove_db(&db_path);
+}
+
+/// Prefer-HTTPS end to end: with 80+443 seeded open and nothing listening on
+/// 443, `--verbose` prints `skipped 127.0.0.1:80 (prefer 443)`, the 443
+/// failure falls back to port 80 exactly once, the summary reports
+/// `skipped_prefer_https=1` + `fallback_to_http=1`, and the scan rows stay
+/// open.
+#[test]
+fn fingerprint_prefer_https_skips_80_verbose_and_falls_back() {
+    let tag = temp_tag("prefer-https");
+    let db_path = temp_path(&tag, "db");
+    seed_open_ports(&db_path, &[80, 443]);
+
+    let output = Command::new(ftw_bin())
+        .args([
+            "fingerprint",
+            "--db",
+            &db_path.to_string_lossy(),
+            "--verbose",
+        ])
+        .output()
+        .expect("run ftw fingerprint");
+    assert!(
+        output.status.success(),
+        "fingerprint failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(
+        stderr.contains("skipped 127.0.0.1:80 (prefer 443)"),
+        "verbose stderr names the skipped port: {stderr}"
+    );
+    assert!(
+        stderr.contains("skipped_prefer_https=1"),
+        "summary reports 1 skipped: {stderr}"
+    );
+    assert!(
+        stderr.contains("fallback_to_http=1"),
+        "summary reports 1 fallback: {stderr}"
+    );
+
+    // Only the 443 row plus a single fallback 80 row exist; the skipped port
+    // gets no row of its own beyond the fallback attempt.
+    let ports = db_int_rows(&db_path, "SELECT port FROM fingerprint_results ORDER BY port");
+    assert_eq!(ports, vec![80, 443]);
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    assert_eq!(
+        stdout.lines().count(),
+        2,
+        "stdout carries one live JSON line per fingerprinted port"
+    );
+
+    // The scan rows are untouched: both ports still read open.
+    let scan = db_text_rows(
+        &db_path,
+        "SELECT port || ' ' || status FROM scan_results WHERE ip = '127.0.0.1' ORDER BY port",
+    );
+    assert_eq!(scan, vec!["80 open".to_string(), "443 open".to_string()]);
+
+    remove_db(&db_path);
+}
+
+/// `--no-prefer-https` end to end: both seeded ports are fingerprinted with
+/// no skipping and no fallback, and the summary reports zeros.
+#[test]
+fn fingerprint_no_prefer_https_fingerprints_both() {
+    let tag = temp_tag("no-prefer-https");
+    let db_path = temp_path(&tag, "db");
+    seed_open_ports(&db_path, &[80, 443]);
+
+    let output = Command::new(ftw_bin())
+        .args([
+            "fingerprint",
+            "--db",
+            &db_path.to_string_lossy(),
+            "--no-prefer-https",
+            "--quiet",
+        ])
+        .output()
+        .expect("run ftw fingerprint");
+    assert!(
+        output.status.success(),
+        "fingerprint failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let ports = db_int_rows(&db_path, "SELECT port FROM fingerprint_results ORDER BY port");
+    assert_eq!(
+        ports,
+        vec![80, 443],
+        "both ports are fingerprinted with deduplication off"
+    );
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(
+        stderr.contains("skipped_prefer_https=0"),
+        "summary reports 0 skipped: {stderr}"
+    );
+    assert!(
+        stderr.contains("fallback_to_http=0"),
+        "summary reports 0 fallback: {stderr}"
+    );
+    assert!(
+        !stderr.contains("skipped 127.0.0.1:80"),
+        "no skip line is printed with deduplication off: {stderr}"
+    );
+
+    remove_db(&db_path);
+}
+
+/// Prefer-HTTPS happy path end to end: with 80+443 seeded open and a real
+/// TLS server answering on 443, the pipeline fingerprints ONLY the 443 row
+/// (HTTPS 200, no fallback), the scan rows stay open, verbose prints the
+/// skip line, and the summary reports `skipped_prefer_https=1` with
+/// `fallback_to_http=0`.
+///
+/// Fixture mechanics: literal port 443 is unbindable without privileges, so
+/// `tests/shim_443.c` (built here with `cc`, the same kind of external-tool
+/// fixture dependency as the `openssl` server in the unit tests)
+/// transparently remaps port 443 to a free high port for both the
+/// `openssl s_server` fixture and the `ftw` binary. The pipeline itself is
+/// unmodified — it asks for literal 443 over HTTPS — so a recorded
+/// `scheme: https` + `status: 200` row proves the real HTTPS code path ran.
+#[test]
+fn fingerprint_prefer_https_happy_path_fingerprints_only_443() {
+    let tag = temp_tag("prefer-happy");
+    let dir = std::env::temp_dir();
+    let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let shim_src = manifest.join("tests").join("shim_443.c");
+    let shim = dir.join(format!("{tag}-shim.so"));
+    let key = dir.join(format!("{tag}-key.pem"));
+    let cert = dir.join(format!("{tag}-cert.pem"));
+    let db_path = temp_path(&tag, "db");
+    let shim_text = shim.to_string_lossy().into_owned();
+
+    // Free high port standing in for 443 via the shim.
+    let shadow = {
+        let sock = std::net::TcpListener::bind("127.0.0.1:0").expect("bind temp port");
+        sock.local_addr().expect("temp addr").port()
+    };
+    let shadow_text = shadow.to_string();
+
+    let cc = Command::new("cc")
+        .args([
+            "-shared",
+            "-fPIC",
+            "-O2",
+            "-o",
+            shim_text.as_str(),
+            shim_src.to_string_lossy().as_ref(),
+            "-ldl",
+        ])
+        .output()
+        .expect("build port-443 shim (needs cc)");
+    assert!(
+        cc.status.success(),
+        "cc must build the shim: {}",
+        String::from_utf8_lossy(&cc.stderr)
+    );
+
+    let mint = Command::new("openssl")
+        .args([
+            "req",
+            "-x509",
+            "-newkey",
+            "rsa:2048",
+            "-keyout",
+            &key.to_string_lossy(),
+            "-out",
+            &cert.to_string_lossy(),
+            "-days",
+            "1",
+            "-nodes",
+            "-subj",
+            "/CN=127.0.0.1",
+        ])
+        .output()
+        .expect("mint test certificate");
+    assert!(
+        mint.status.success(),
+        "openssl must mint the test certificate: {}",
+        String::from_utf8_lossy(&mint.stderr)
+    );
+
+    seed_open_ports(&db_path, &[80, 443]);
+
+    let mut server = Command::new("openssl")
+        .env("LD_PRELOAD", &shim_text)
+        .env("FTW_SHADOW_PORT", &shadow_text)
+        .args([
+            "s_server",
+            "-accept",
+            "443",
+            "-cert",
+            &cert.to_string_lossy(),
+            "-key",
+            &key.to_string_lossy(),
+            "-www",
+        ])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .expect("start s_server");
+
+    let mut ready = false;
+    for _ in 0..200 {
+        let probe = Command::new("curl")
+            .env("LD_PRELOAD", &shim_text)
+            .env("FTW_SHADOW_PORT", &shadow_text)
+            .args([
+                "-sk",
+                "-o",
+                "/dev/null",
+                "-w",
+                "%{http_code}",
+                "https://127.0.0.1:443/",
+            ])
+            .output();
+        if let Ok(probe) = probe {
+            if probe.status.success()
+                && String::from_utf8_lossy(&probe.stdout).trim() == "200"
+            {
+                ready = true;
+                break;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    if !ready {
+        let _ = server.kill();
+        let _ = server.wait();
+        panic!("s_server never came up on shadow port {shadow}");
+    }
+
+    let output = Command::new(ftw_bin())
+        .env("LD_PRELOAD", &shim_text)
+        .env("FTW_SHADOW_PORT", &shadow_text)
+        .args([
+            "fingerprint",
+            "--db",
+            &db_path.to_string_lossy(),
+            "--verbose",
+            "--insecure",
+        ])
+        .output()
+        .expect("run ftw fingerprint");
+    let _ = server.kill();
+    let _ = server.wait();
+    assert!(
+        output.status.success(),
+        "fingerprint failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let stderr = String::from_utf8(output.stderr).expect("stderr utf8");
+    assert!(
+        stderr.contains("skipped 127.0.0.1:80 (prefer 443)"),
+        "verbose stderr names the skipped port: {stderr}"
+    );
+    assert!(
+        stderr.contains("skipped_prefer_https=1"),
+        "summary reports 1 skipped: {stderr}"
+    );
+    assert!(
+        stderr.contains("fallback_to_http=0"),
+        "summary reports 0 fallback: {stderr}"
+    );
+
+    // Exactly one fingerprint row exists, and it is the HTTPS 200 on 443:
+    // the skipped port 80 leaves no row.
+    assert_eq!(
+        db_int_rows(&db_path, "SELECT port FROM fingerprint_results ORDER BY port"),
+        vec![443]
+    );
+    assert_eq!(
+        db_text_rows(&db_path, "SELECT scheme FROM fingerprint_results"),
+        vec!["https".to_string()]
+    );
+    assert_eq!(
+        db_int_rows(&db_path, "SELECT status FROM fingerprint_results"),
+        vec![200]
+    );
+    let stdout = String::from_utf8(output.stdout).expect("stdout utf8");
+    assert_eq!(
+        stdout.lines().count(),
+        1,
+        "stdout carries one live JSON line for the single fingerprinted port"
+    );
+    let record: serde_json::Value =
+        serde_json::from_str(stdout.trim()).expect("stdout line is JSON");
+    assert_eq!(record["port"], 443);
+    assert_eq!(record["scheme"], "https");
+    assert_eq!(record["status"], 200);
+
+    // The scan rows are untouched: both ports still read open.
+    assert_eq!(
+        db_text_rows(
+            &db_path,
+            "SELECT port || ' ' || status FROM scan_results WHERE ip = '127.0.0.1' ORDER BY port"
+        ),
+        vec!["80 open".to_string(), "443 open".to_string()]
+    );
+
+    std::fs::remove_file(&shim).ok();
+    std::fs::remove_file(&key).ok();
+    std::fs::remove_file(&cert).ok();
     remove_db(&db_path);
 }

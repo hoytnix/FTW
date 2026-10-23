@@ -6,11 +6,21 @@
 - `cargo build` clean, 0 warnings.
 - `cargo clippy --all-targets -- -D warnings` clean (system stable toolchain;
   clippy 0.1.99).
-- `cargo test` 60/60 green (52 unit + 8 CLI in `tests/live_output.rs`).
+- `cargo test` 70/70 green (59 unit + 11 CLI in `tests/live_output.rs`).
   Scan/fingerprint detection, fetch-mode, tech, and verbose/quiet behavior
   unchanged; results moved from files to the master SQLite database, and the
   new `crawl` subcommand is covered (chain/cycle/external/depth, non-HTML,
   redirects, skips, error kinds, single-writer proof, legacy-flag rejection).
+  Prefer-HTTPS fingerprint deduplication covered (grouping matrix incl. IPv6,
+  fallback-condition matrix, HTTPS-only attempt proofs incl. a live
+  `openssl s_server` TLS 200, pipeline fallback + opt-out runs, CLI verbose
+  skip line + summary counts, plus the happy-path DB test below).
+  Happy-path DB test (`fingerprint_prefer_https_happy_path_fingerprints_only_443`):
+  seeds 127.0.0.1:80+443 open, runs the real pipeline against a TLS fixture
+  on 443 (via `tests/shim_443.c`, built with `cc` at test time, remapping
+  port 443 to a free high port since low ports are unbindable here), and
+  asserts only the 443 row (`https`/200), open scan rows, and
+  `skipped_prefer_https=1` + `fallback_to_http=0`.
 
 ## Completed modules
 - `src/db.rs` (new): master SQLite database, opened once per run (WAL,

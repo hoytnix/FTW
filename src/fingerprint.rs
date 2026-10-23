@@ -20,10 +20,12 @@
 //! kept in memory for parsing only — never written to the output, never
 //! re-fetched, and never followed with extra requests.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
 use reqwest::header::HeaderMap;
@@ -106,6 +108,9 @@ pub struct FingerprintConfig {
     pub max_redirects: usize,
     pub body_cap: usize,
     pub fetch_mode: FetchMode,
+    /// Disable the prefer-HTTPS queue deduplication (`--no-prefer-https`):
+    /// fingerprint every open port, with no 80/443 skipping and no fallback.
+    pub no_prefer_https: bool,
 }
 
 /// One JSON-lines fingerprint record.
@@ -151,6 +156,12 @@ pub struct FingerprintStats {
     pub other_errors: usize,
     pub php_detected: usize,
     pub php_not_detected: usize,
+    /// Open ports skipped by prefer-HTTPS deduplication (80s with a
+    /// same-IP 443 also open). Skipped ports never produce a record.
+    pub skipped_prefer_https: usize,
+    /// Port-80 records fingerprinted only because the preferred 443 attempt
+    /// failed outright (no HTTP status; timeout, TLS, or connect error).
+    pub fallback_to_http: usize,
 }
 
 impl FingerprintStats {
@@ -169,6 +180,70 @@ impl FingerprintStats {
             self.php_not_detected += 1;
         }
     }
+}
+
+/// One stderr summary line for a fingerprint run, including the prefer-HTTPS
+/// deduplication counts. Kept as a function (instead of inline in the CLI
+/// wiring) so tests can assert the exact tokens without spawning the binary.
+#[must_use]
+pub fn format_summary(stats: &FingerprintStats) -> String {
+    format!(
+        "ftw: fingerprinted {} targets: {} http, {} tls errors, {} connect errors, {} timeouts, {} other errors; php detected on {}, not detected on {}; skipped_prefer_https={}, fallback_to_http={}",
+        stats.total,
+        stats.http,
+        stats.tls_errors,
+        stats.connect_errors,
+        stats.timeouts,
+        stats.other_errors,
+        stats.php_detected,
+        stats.php_not_detected,
+        stats.skipped_prefer_https,
+        stats.fallback_to_http,
+    )
+}
+
+/// Open `(ip, port)` targets in sorted queue order.
+pub type OpenTargets = Vec<(IpAddr, u16)>;
+
+/// Prefer-HTTPS queue deduplication: split open `(ip, port)` targets into
+/// `(to_fingerprint, skipped)`.
+///
+/// When one IP has BOTH port 80 and port 443 open, only 443 is fingerprinted
+/// and the port-80 entry is skipped (no record, no crawl seed; the
+/// `scan_results` row is untouched). Nothing else is deduplicated: any other
+/// port pair (8080/8443, 80/8080, 443/8443, ...) keeps both ports, lone 80s
+/// and lone 443s are fingerprinted normally, and different IPs never share a
+/// decision even when they resolve to the same hostname. Both lists are
+/// sorted for a deterministic queue order.
+#[must_use]
+pub fn split_prefer_https_targets(targets: &[(IpAddr, u16)]) -> (OpenTargets, OpenTargets) {
+    let open: HashSet<(IpAddr, u16)> = targets.iter().copied().collect();
+    let mut primary = Vec::new();
+    let mut skipped = Vec::new();
+    let mut ordered: OpenTargets = targets.to_vec();
+    ordered.sort_unstable();
+    ordered.dedup();
+    for (ip, port) in ordered {
+        if port == 80 && open.contains(&(ip, 443)) {
+            skipped.push((ip, port));
+        } else {
+            primary.push((ip, port));
+        }
+    }
+    (primary, skipped)
+}
+
+/// True when the preferred-443 attempt failed outright and port 80 must be
+/// fingerprinted once as a fallback: no HTTP status was recorded at all and
+/// the error is a transport failure (`timeout`, `tls_error`, or
+/// `connect_error`). ANY recorded status — including 400, 404, or 500 — is a
+/// completed fingerprint and never falls back.
+fn needs_http_fallback(record: &FingerprintRecord) -> bool {
+    record.status.is_none()
+        && matches!(
+            record.error.as_deref(),
+            Some("timeout") | Some("tls_error") | Some("connect_error")
+        )
 }
 
 /// Build the shared HTTP client: clear FTW User-Agent, per-attempt timeout,
@@ -687,6 +762,12 @@ pub async fn run(
 /// Same as [`run`], with live-output options for the single writer task.
 /// The writer remains the only place that prints per-event output; fingerprint
 /// tasks never print directly.
+///
+/// Prefer-HTTPS deduplication applies unless the run opts out with
+/// `no_prefer_https` or forces plain HTTP with `Scheme::Http`: an IP with
+/// both 80 and 443 open fingerprints only 443 (over HTTPS — never a
+/// plain-HTTP request to port 443), the skipped port 80 produces no record,
+/// and a 443 transport failure falls back to port 80 exactly once.
 pub async fn run_with_options(
     config: &FingerprintConfig,
     db_path: PathBuf,
@@ -697,13 +778,33 @@ pub async fn run_with_options(
     if targets.is_empty() {
         eprintln!("ftw: warning: no open ports found in database");
     }
+    // An explicit `--scheme http` run disables prefer-HTTPS entirely: the
+    // user asked for plain HTTP on every port, so both 80 and 443 are
+    // fingerprinted as requested with no skipping and no fallback.
+    let prefer = !config.no_prefer_https && config.scheme != Scheme::Http;
+    let (primary, skipped) = if prefer {
+        split_prefer_https_targets(&targets)
+    } else {
+        (targets, Vec::new())
+    };
+    // Skipped ports are reported here, up front, so they are obvious from
+    // verbose output alone even though they never produce a record. Skipped
+    // ports never reach the database: only actually fingerprinted ports
+    // (including fallback attempts) are sent to the writer.
+    if options.verbose {
+        for (ip, port) in &skipped {
+            eprintln!("skipped {ip}:{port} (prefer 443)");
+        }
+    }
+    let skipped_ips: HashSet<IpAddr> = skipped.iter().map(|(ip, _)| *ip).collect();
+    let fallbacks = Arc::new(AtomicUsize::new(0));
     let client = build_client(config)?;
-    eprintln!("ftw: fingerprinting {} open host:port targets", targets.len());
+    eprintln!("ftw: fingerprinting {} open host:port targets", primary.len());
     let (tx, rx) = mpsc::channel::<FingerprintRecord>(CHANNEL_CAPACITY);
     let writer =
         tokio::spawn(async move { output::run_fingerprint_db_writer(rx, conn, options).await });
     let semaphore = Arc::new(Semaphore::new(config.concurrency.max(1)));
-    for (ip, port) in targets {
+    for (ip, port) in primary {
         let permit = semaphore
             .clone()
             .acquire_owned()
@@ -712,14 +813,34 @@ pub async fn run_with_options(
         let tx = tx.clone();
         let client = client.clone();
         let config = *config;
+        let preferred = prefer && port == 443 && skipped_ips.contains(&ip);
+        let fallbacks = fallbacks.clone();
         tokio::spawn(async move {
-            let record = fingerprint_target(&client, &config, ip, port).await;
-            drop(permit);
-            let _ = tx.send(record).await;
+            if preferred {
+                // The deduped port: HTTPS only, so a plain-HTTP request is
+                // never sent to port 443. One permit covers the whole
+                // sequence, and the port-80 fallback runs at most once.
+                let record =
+                    attempt(&client, "https", ip, port, config.body_cap, config.fetch_mode).await;
+                let fallback = needs_http_fallback(&record);
+                drop(permit);
+                let _ = tx.send(record).await;
+                if fallback {
+                    let http_record = fingerprint_target(&client, &config, ip, 80).await;
+                    fallbacks.fetch_add(1, Ordering::Relaxed);
+                    let _ = tx.send(http_record).await;
+                }
+            } else {
+                let record = fingerprint_target(&client, &config, ip, port).await;
+                drop(permit);
+                let _ = tx.send(record).await;
+            }
         });
     }
     drop(tx);
-    let stats = writer.await??;
+    let mut stats = writer.await??;
+    stats.skipped_prefer_https = skipped.len();
+    stats.fallback_to_http = fallbacks.load(Ordering::Relaxed);
     Ok(stats)
 }
 
@@ -749,6 +870,7 @@ mod tests {
             max_redirects: 5,
             body_cap: 8192,
             fetch_mode: FetchMode::Get,
+            no_prefer_https: false,
         }
     }
 
@@ -1581,5 +1703,428 @@ mod tests {
         assert!(!record["error"].is_null(), "HEAD 405 must record an error");
         assert_eq!(log, vec![("HEAD".to_string(), "/".to_string())]);
         assert_only_root_requests(&log);
+    }
+
+    fn prefer_target(ip: &str, port: u16) -> (IpAddr, u16) {
+        (ip.parse().expect("test ip"), port)
+    }
+
+    /// Grouping logic: only the 80/443 pair on a single IP collapses to 443.
+    /// Lone ports, other pairs, and other IPs are never deduplicated.
+    #[test]
+    fn prefer_https_grouping_only_skips_dual_port_80() {
+        // (ip,80)+(ip,443) yields only 443.
+        let (primary, skipped) = split_prefer_https_targets(&[
+            prefer_target("127.0.0.1", 80),
+            prefer_target("127.0.0.1", 443),
+        ]);
+        assert_eq!(primary, vec![prefer_target("127.0.0.1", 443)]);
+        assert_eq!(skipped, vec![prefer_target("127.0.0.1", 80)]);
+
+        // (ip,80) alone yields 80; (ip,443) alone yields 443.
+        let (primary, skipped) = split_prefer_https_targets(&[prefer_target("127.0.0.1", 80)]);
+        assert_eq!(primary, vec![prefer_target("127.0.0.1", 80)]);
+        assert!(skipped.is_empty());
+        let (primary, skipped) = split_prefer_https_targets(&[prefer_target("127.0.0.1", 443)]);
+        assert_eq!(primary, vec![prefer_target("127.0.0.1", 443)]);
+        assert!(skipped.is_empty());
+
+        // (ip,8080)+(ip,8443) yields both — no other pair is deduplicated.
+        let (primary, skipped) = split_prefer_https_targets(&[
+            prefer_target("127.0.0.1", 8080),
+            prefer_target("127.0.0.1", 8443),
+        ]);
+        assert_eq!(
+            primary,
+            vec![
+                prefer_target("127.0.0.1", 8080),
+                prefer_target("127.0.0.1", 8443),
+            ]
+        );
+        assert!(skipped.is_empty());
+
+        // 80/8080 and 443/8443 pairs also keep both ports.
+        let (primary, skipped) = split_prefer_https_targets(&[
+            prefer_target("127.0.0.1", 80),
+            prefer_target("127.0.0.1", 8080),
+        ]);
+        assert_eq!(primary.len(), 2);
+        assert!(skipped.is_empty());
+        let (primary, skipped) = split_prefer_https_targets(&[
+            prefer_target("127.0.0.1", 443),
+            prefer_target("127.0.0.1", 8443),
+        ]);
+        assert_eq!(primary.len(), 2);
+        assert!(skipped.is_empty());
+
+        // Two different IPs with 80/443 each yield 443 for each IP: no
+        // cross-IP deduplication even for the same port pair.
+        let (primary, skipped) = split_prefer_https_targets(&[
+            prefer_target("127.0.0.1", 80),
+            prefer_target("127.0.0.1", 443),
+            prefer_target("192.168.1.1", 80),
+            prefer_target("192.168.1.1", 443),
+        ]);
+        assert_eq!(
+            primary,
+            vec![
+                prefer_target("127.0.0.1", 443),
+                prefer_target("192.168.1.1", 443),
+            ]
+        );
+        assert_eq!(
+            skipped,
+            vec![
+                prefer_target("127.0.0.1", 80),
+                prefer_target("192.168.1.1", 80),
+            ]
+        );
+
+        // An 80 without a same-IP 443 is kept even when another IP has 443.
+        let (primary, skipped) = split_prefer_https_targets(&[
+            prefer_target("127.0.0.1", 80),
+            prefer_target("192.168.1.1", 443),
+        ]);
+        assert_eq!(primary.len(), 2);
+        assert!(skipped.is_empty());
+
+        // IPv6 pairs collapse exactly like IPv4 pairs.
+        let (primary, skipped) =
+            split_prefer_https_targets(&[prefer_target("::1", 80), prefer_target("::1", 443)]);
+        assert_eq!(primary, vec![prefer_target("::1", 443)]);
+        assert_eq!(skipped, vec![prefer_target("::1", 80)]);
+
+        // A third port on a dual-port host is unaffected: 80+443+8080
+        // fingerprints 443 and 8080, skipping only 80.
+        let (primary, skipped) = split_prefer_https_targets(&[
+            prefer_target("127.0.0.1", 80),
+            prefer_target("127.0.0.1", 443),
+            prefer_target("127.0.0.1", 8080),
+        ]);
+        assert_eq!(
+            primary,
+            vec![
+                prefer_target("127.0.0.1", 443),
+                prefer_target("127.0.0.1", 8080),
+            ]
+        );
+        assert_eq!(skipped, vec![prefer_target("127.0.0.1", 80)]);
+    }
+
+    fn fallback_record(status: Option<u16>, error: Option<&str>) -> FingerprintRecord {
+        FingerprintRecord {
+            ip: "127.0.0.1".to_string(),
+            port: 443,
+            scheme: "https".to_string(),
+            final_url: "https://127.0.0.1:443/".to_string(),
+            status,
+            server: None,
+            tls: "error".to_string(),
+            error: error.map(str::to_string),
+            php_detected: false,
+            php_version: None,
+            php_signals: Vec::new(),
+            wordpress_detected: false,
+            wordpress_version: None,
+            wordpress_signals: Vec::new(),
+            php_apps: Vec::new(),
+            tailwind_detected: false,
+            tailwind_confidence: "none".to_string(),
+            tailwind_signals: Vec::new(),
+            fetch_method: "get".to_string(),
+            head_status: None,
+        }
+    }
+
+    /// Fallback condition: only an outright transport failure (no HTTP status
+    /// plus timeout/tls_error/connect_error) falls back. ANY recorded status —
+    /// including 400, 404, and 500 — is a completed fingerprint.
+    #[test]
+    fn http_fallback_only_on_outright_transport_failure() {
+        for error in ["timeout", "tls_error", "connect_error"] {
+            assert!(
+                needs_http_fallback(&fallback_record(None, Some(error))),
+                "{error} without a status must fall back"
+            );
+        }
+        for status in [200u16, 301, 400, 404, 500] {
+            assert!(
+                !needs_http_fallback(&fallback_record(Some(status), None)),
+                "status {status} must never fall back"
+            );
+        }
+        assert!(
+            !needs_http_fallback(&fallback_record(None, Some("other"))),
+            "an unclassified error must not fall back"
+        );
+        assert!(
+            !needs_http_fallback(&fallback_record(None, None)),
+            "no error at all must not fall back"
+        );
+    }
+
+    /// The stderr summary carries the exact prefer-HTTPS count tokens.
+    #[test]
+    fn summary_reports_skip_and_fallback_counts() {
+        let stats = FingerprintStats {
+            total: 2,
+            http: 1,
+            connect_errors: 1,
+            php_detected: 1,
+            php_not_detected: 1,
+            skipped_prefer_https: 1,
+            fallback_to_http: 1,
+            ..Default::default()
+        };
+        let line = format_summary(&stats);
+        assert!(
+            line.starts_with("ftw: fingerprinted 2 targets"),
+            "summary keeps its existing shape: {line}"
+        );
+        assert!(
+            line.contains("skipped_prefer_https=1"),
+            "summary reports the skipped count: {line}"
+        );
+        assert!(
+            line.contains("fallback_to_http=1"),
+            "summary reports the fallback count: {line}"
+        );
+        let zero = format_summary(&FingerprintStats::default());
+        assert!(
+            zero.contains("skipped_prefer_https=0") && zero.contains("fallback_to_http=0"),
+            "a run with no deduplication reports zeros: {zero}"
+        );
+    }
+
+    /// An HTTPS attempt against a plain-HTTP server fails as a TLS error and
+    /// — critically — the server never sees a plaintext HTTP request line, so
+    /// no plain-HTTP request is ever sent to a TLS port in prefer-HTTPS mode.
+    #[tokio::test]
+    async fn https_attempt_sends_no_plaintext_http() {
+        let (addr, log, server) =
+            spawn_method_server(200, Vec::new(), Vec::new(), "hello").await;
+        let config = test_config(Scheme::Https);
+        let client = build_client(&config).expect("build client");
+        let record = attempt(
+            &client,
+            "https",
+            addr.ip(),
+            addr.port(),
+            config.body_cap,
+            FetchMode::Get,
+        )
+        .await;
+        server.abort();
+        assert_eq!(record.scheme, "https");
+        assert!(
+            record.status.is_none(),
+            "the TLS handshake must fail: {record:?}"
+        );
+        assert_eq!(record.error.as_deref(), Some("tls_error"));
+        assert_eq!(record.tls, "error");
+        assert!(
+            record.final_url.starts_with("https://"),
+            "the preferred port is always requested over HTTPS: {}",
+            record.final_url
+        );
+        assert!(
+            needs_http_fallback(&record),
+            "a TLS error with no status must fall back"
+        );
+        let seen = log.lock().expect("method log").clone();
+        assert!(
+            !seen
+                .iter()
+                .any(|(method, _)| method == "GET" || method == "HEAD"),
+            "no plaintext HTTP request may reach a TLS port, got: {seen:?}"
+        );
+    }
+
+    /// A real TLS server (`openssl s_server`) answering 200 proves the
+    /// preferred-port happy path: an HTTPS attempt records a status, so no
+    /// fallback is needed and the skipped port 80 stays untouched.
+    #[tokio::test]
+    async fn https_attempt_succeeds_against_tls_server() {
+        let dir = std::env::temp_dir().join(temp_tag("prefer-tls"));
+        std::fs::create_dir_all(&dir).expect("tls staging dir");
+        let key = dir.join("key.pem");
+        let cert = dir.join("cert.pem");
+        let mint = tokio::process::Command::new("openssl")
+            .args([
+                "req",
+                "-x509",
+                "-newkey",
+                "rsa:2048",
+                "-keyout",
+                &key.to_string_lossy(),
+                "-out",
+                &cert.to_string_lossy(),
+                "-days",
+                "1",
+                "-nodes",
+                "-subj",
+                "/CN=127.0.0.1",
+            ])
+            .output()
+            .await
+            .expect("mint test certificate");
+        assert!(
+            mint.status.success(),
+            "openssl must mint the test certificate: {}",
+            String::from_utf8_lossy(&mint.stderr)
+        );
+        let port = {
+            let tmp = TcpListener::bind("127.0.0.1:0")
+                .await
+                .expect("bind temp port");
+            tmp.local_addr().expect("temp addr").port()
+        };
+        let mut child = tokio::process::Command::new("openssl")
+            .args([
+                "s_server",
+                "-accept",
+                &port.to_string(),
+                "-cert",
+                &cert.to_string_lossy(),
+                "-key",
+                &key.to_string_lossy(),
+                "-www",
+            ])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .expect("start s_server");
+        let start = std::time::Instant::now();
+        loop {
+            if tokio::net::TcpStream::connect(("127.0.0.1", port))
+                .await
+                .is_ok()
+            {
+                break;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "s_server never came up on 127.0.0.1:{port}"
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let mut config = test_config(Scheme::Https);
+        config.insecure = true;
+        let client = build_client(&config).expect("build client");
+        let record = attempt(
+            &client,
+            "https",
+            "127.0.0.1".parse().expect("test ip"),
+            port,
+            config.body_cap,
+            FetchMode::Get,
+        )
+        .await;
+        let _ = child.kill().await;
+        std::fs::remove_dir_all(&dir).ok();
+        assert_eq!(record.status, Some(200), "TLS 200: {record:?}");
+        assert!(record.error.is_none());
+        assert_eq!(record.scheme, "https");
+        assert_eq!(record.tls, "ok");
+        assert!(
+            !needs_http_fallback(&record),
+            "a completed fingerprint never falls back"
+        );
+    }
+
+    fn fingerprint_ports(db_path: &Path) -> Vec<u16> {
+        let conn = rusqlite::Connection::open(db_path).expect("open db");
+        let mut stmt = conn
+            .prepare("SELECT port FROM fingerprint_results ORDER BY port")
+            .expect("prepare query");
+        stmt.query_map([], |row| row.get(0))
+            .expect("map rows")
+            .collect::<Result<_, _>>()
+            .expect("collect rows")
+    }
+
+    fn scan_status(db_path: &Path, port: u16) -> String {
+        let conn = rusqlite::Connection::open(db_path).expect("open db");
+        conn.query_row(
+            "SELECT status FROM scan_results WHERE ip = '127.0.0.1' AND port = ?1",
+            rusqlite::params![port],
+            |row| row.get(0),
+        )
+        .expect("read scan status")
+    }
+
+    /// Fallback end to end: with 80+443 seeded open and nothing listening on
+    /// 443, the preferred HTTPS attempt fails outright (connect error, no
+    /// status), so port 80 is fingerprinted exactly once. The scan rows stay
+    /// open and the stats report 1 skipped + 1 fallback.
+    #[tokio::test]
+    async fn prefer_https_falls_back_to_80_once_when_443_refused() {
+        let db_path = db_path_for(&temp_tag("prefer-fallback"));
+        seed_scan(
+            &db_path,
+            &[
+                ("127.0.0.1".parse().unwrap(), 80, crate::scanner::PortStatus::Open),
+                ("127.0.0.1".parse().unwrap(), 443, crate::scanner::PortStatus::Open),
+            ],
+        );
+        let config = FingerprintConfig {
+            timeout: Duration::from_secs(3),
+            ..test_config(Scheme::Auto)
+        };
+        let stats = run(&config, db_path.clone())
+            .await
+            .expect("fingerprint run");
+        assert_eq!(stats.total, 2, "443 plus exactly one fallback 80: {stats:?}");
+        assert_eq!(stats.skipped_prefer_https, 1, "one 80 skipped: {stats:?}");
+        assert_eq!(stats.fallback_to_http, 1, "one fallback 80: {stats:?}");
+        assert_eq!(
+            fingerprint_ports(&db_path),
+            vec![80, 443],
+            "only the 443 row plus a single fallback 80 row exist"
+        );
+        assert_eq!(
+            scan_status(&db_path, 80),
+            "open",
+            "the scan row for the skipped port stays untouched"
+        );
+        assert_eq!(scan_status(&db_path, 443), "open");
+        remove_db(&db_path);
+    }
+
+    /// Opt-out end to end: with `--no-prefer-https` (and, separately, with an
+    /// explicit `--scheme http` and no flag) both seeded ports are
+    /// fingerprinted, with no skipping and no fallback.
+    #[tokio::test]
+    async fn no_prefer_https_fingerprints_both_ports() {
+        for (scheme, no_prefer_https) in [(Scheme::Auto, true), (Scheme::Http, false)] {
+            let db_path = db_path_for(&temp_tag("prefer-optout"));
+            seed_scan(
+                &db_path,
+                &[
+                    ("127.0.0.1".parse().unwrap(), 80, crate::scanner::PortStatus::Open),
+                    ("127.0.0.1".parse().unwrap(), 443, crate::scanner::PortStatus::Open),
+                ],
+            );
+            let config = FingerprintConfig {
+                timeout: Duration::from_secs(3),
+                no_prefer_https,
+                ..test_config(scheme)
+            };
+            let stats = run(&config, db_path.clone())
+                .await
+                .expect("fingerprint run");
+            assert_eq!(
+                stats.total, 2,
+                "scheme={scheme} no_prefer_https={no_prefer_https}: both ports: {stats:?}"
+            );
+            assert_eq!(stats.skipped_prefer_https, 0, "nothing skipped");
+            assert_eq!(stats.fallback_to_http, 0, "no fallback without deduplication");
+            assert_eq!(
+                fingerprint_ports(&db_path),
+                vec![80, 443],
+                "both ports have rows when deduplication is off"
+            );
+            remove_db(&db_path);
+        }
     }
 }

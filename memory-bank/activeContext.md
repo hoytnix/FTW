@@ -48,6 +48,26 @@ under `scan` subcommand).
    Single writer task owns the only connection (WAL, busy_timeout 5000,
    synchronous NORMAL, checkpoint on exit). Changes left uncommitted.
 10. Sync this file + progress.md; leave changes uncommitted for review.
+11. Prefer-HTTPS fingerprint deduplication applied and verified: `cargo build`
+    clean, `cargo clippy --all-targets -- -D warnings` clean,
+    `cargo test` 69/69 green (59 unit + 10 CLI). `ftw fingerprint` now groups
+    open ports by IP and, by default, fingerprints only 443 (HTTPS-only, never
+    plaintext HTTP to 443) when one IP has both 80 and 443 open; the skipped
+    80 gets no row and no crawl seed, and a 443 transport failure
+    (timeout/tls_error/connect_error, no status) falls back to 80 exactly
+    once. `--scheme http` or `--no-prefer-https` disables it entirely.
+    Summary now ends with `skipped_prefer_https=` + `fallback_to_http=`;
+    `--verbose` prints `skipped <ip>:80 (prefer 443)` per skip. Scan targets,
+    detection, schema, and verbose/quiet behavior unchanged. Changes left
+    uncommitted.
+12. Happy-path DB integration test added and verified: literal port 443 is
+    unbindable without privileges here, so new `tests/shim_443.c` (built with
+    `cc` at test time) remaps port 443 to a free high port for both the
+    `openssl s_server` TLS fixture and the `ftw` binary; seeded 80+443 yields
+    only the 443 row (HTTPS 200), scan rows stay open, summary reports
+    `skipped_prefer_https=1` + `fallback_to_http=0`. `cargo build` /
+    clippy / `cargo test` 70/70 green (59 unit + 11 CLI). Changes left
+    uncommitted.
 
 ## Recent state changes
 - 2026-10-23: added hacker-zine README.md + Kopimi LICENSE; banner swapped

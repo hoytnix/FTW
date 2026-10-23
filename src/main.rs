@@ -107,6 +107,11 @@ struct FingerprintArgs {
     #[arg(long, value_enum, default_value_t = fingerprint::FetchMode::Get)]
     fetch_mode: fingerprint::FetchMode,
 
+    /// Fingerprint every open port, disabling the default prefer-HTTPS
+    /// deduplication (which skips port 80 when the same IP also has 443 open)
+    #[arg(long)]
+    no_prefer_https: bool,
+
     /// Master SQLite database file holding all scan/fingerprint/crawl results
     #[arg(long, value_name = "FILE", default_value = "ftw.db")]
     db: PathBuf,
@@ -271,21 +276,12 @@ async fn run_fingerprint(cli: FingerprintArgs) -> Result<(), Box<dyn std::error:
         max_redirects: cli.max_redirects,
         body_cap: cli.body_cap,
         fetch_mode: cli.fetch_mode,
+        no_prefer_https: cli.no_prefer_https,
     };
     let options = output::OutputOptions::new(cli.verbose, cli.quiet);
     let stats =
         fingerprint::run_with_options(&config, cli.db, options).await?;
-    eprintln!(
-        "ftw: fingerprinted {} targets: {} http, {} tls errors, {} connect errors, {} timeouts, {} other errors; php detected on {}, not detected on {}",
-        stats.total,
-        stats.http,
-        stats.tls_errors,
-        stats.connect_errors,
-        stats.timeouts,
-        stats.other_errors,
-        stats.php_detected,
-        stats.php_not_detected,
-    );
+    eprintln!("{}", fingerprint::format_summary(&stats));
     Ok(())
 }
 
