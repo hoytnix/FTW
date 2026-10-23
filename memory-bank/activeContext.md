@@ -98,7 +98,16 @@ under `scan` subcommand).
     config key removed, parser/credential-refusal code deleted). Verified:
     build/clippy clean, 112/112 tests green (96 unit + 16 CLI), live smoke
     of empty-seed warning and flag rejection. probe `--host-check` JSONL
-    merge unchanged. Left uncommitted.
+    merge unchanged. Committed and pushed (b26057d).
+17. `ftw crawl --max-depth` redefined (was hop count, default 2): now
+    absolute URL depth from the host root via new `url_depth()` (`/` = 1,
+    index pages count as their directory), default -1 = no limit, 0 and
+    < -1 rejected by new `config::require_valid_depth`
+    (`allow_hyphen_values` so `-1` parses). Seeds always fetched;
+    over-deep pages recorded but followed nowhere; `depth` in every
+    streamed JSONL stdout line, the verbose line, and `crawl_pages`.
+    Verified: build/clippy clean, 117/117 green (100 unit + 17 CLI),
+    incl. new absolute-depth loopback test. Left uncommitted, not pushed.
 17. Phase 2 fingerprinting probe (`ftw probe`) + authoritative on-host check
     (`ftw host-check`) implemented and verified for authorized ranges only:
     new `src/probe.rs` (port-fixed scheme, single GET / with 32 KiB cap,

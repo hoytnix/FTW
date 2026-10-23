@@ -155,7 +155,7 @@ pub struct FingerprintSection {
 pub struct CrawlSection {
     pub concurrency: Option<usize>,
     pub timeout: Option<TimeoutSecs>,
-    pub max_depth: Option<usize>,
+    pub max_depth: Option<i64>,
     pub max_pages: Option<usize>,
     pub body_cap: Option<usize>,
     pub max_redirects: Option<usize>,
@@ -341,6 +341,28 @@ pub fn require_at_least_one(
     })
 }
 
+/// Reject max_depth values that are neither -1 (no limit) nor >= 1.
+/// Zero and anything below -1 are errors, whether they came from the CLI
+/// or the config file.
+pub fn require_valid_depth(
+    section: &str,
+    key: &str,
+    value: i64,
+    source: Source,
+    cfg_path: Option<&Path>,
+) -> Result<(), String> {
+    if value == -1 || value >= 1 {
+        return Ok(());
+    }
+    Err(match (source, cfg_path) {
+        (Source::Config, Some(path)) => format!(
+            "{}: [{section}] {key} must be -1 (no limit) or at least 1",
+            path.display()
+        ),
+        _ => format!("[{section}] {key} must be -1 (no limit) or at least 1"),
+    })
+}
+
 /// Reject non-positive or non-finite timeouts.
 pub fn require_positive_seconds(
     section: &str,
@@ -480,6 +502,23 @@ mod tests {
                 .is_err()
         );
         assert!(require_positive_seconds("crawl", "timeout", 2.5, Source::Config, None).is_ok());
+    }
+
+    #[test]
+    fn valid_depth_accepts_only_minus_one_or_at_least_one() {
+        for value in [-1, 1, 2, 100] {
+            assert!(
+                require_valid_depth("crawl", "max_depth", value, Source::Cli, None).is_ok(),
+                "{value} must be accepted"
+            );
+        }
+        for value in [i64::MIN, -100, -2, 0] {
+            let err =
+                require_valid_depth("crawl", "max_depth", value, Source::Cli, None).expect_err(
+                    "{value} must be rejected",
+                );
+            assert!(err.contains("max_depth"), "names the key: {err}");
+        }
     }
 
     /// Explicit `--config` to a missing file fails before any work.

@@ -177,9 +177,10 @@ struct CrawlArgs {
     #[arg(long, value_name = "SECS")]
     timeout: Option<f64>,
 
-    /// Maximum link depth to fetch (depth 0 is the seed page) (default 2)
-    #[arg(long)]
-    max_depth: Option<usize>,
+    /// Maximum URL depth to fetch, absolute from the host root (/ is 1);
+    /// -1 means no limit (default -1)
+    #[arg(long, value_name = "N", allow_hyphen_values(true))]
+    max_depth: Option<i64>,
 
     /// Maximum pages to visit in total (default 1000)
     #[arg(long)]
@@ -558,7 +559,7 @@ async fn run_crawl(cli: CrawlArgs) -> Result<(), Box<dyn std::error::Error + Sen
     let (concurrency, concurrency_src) = config::resolve(cli.concurrency, cfg.concurrency, 100);
     let (timeout_secs, timeout_src) =
         config::resolve(cli.timeout, cfg.timeout.map(|t| t.0), 5.0);
-    let (max_depth, max_depth_src) = config::resolve(cli.max_depth, cfg.max_depth, 2);
+    let (max_depth, max_depth_src) = config::resolve(cli.max_depth, cfg.max_depth, -1);
     let (max_pages, max_pages_src) = config::resolve(cli.max_pages, cfg.max_pages, 1000);
     let (body_cap, body_cap_src) = config::resolve(cli.body_cap, cfg.body_cap, 262144);
     let (max_redirects, max_redirects_src) =
@@ -586,6 +587,7 @@ async fn run_crawl(cli: CrawlArgs) -> Result<(), Box<dyn std::error::Error + Sen
     config::require_at_least_one("crawl", "concurrency", concurrency, concurrency_src, cfg_ref)?;
     config::require_positive_seconds("crawl", "timeout", timeout_secs, timeout_src, cfg_ref)?;
     config::require_at_least_one("crawl", "max_pages", max_pages, max_pages_src, cfg_ref)?;
+    config::require_valid_depth("crawl", "max_depth", max_depth, max_depth_src, cfg_ref)?;
     let timeout = check_timeout(timeout_secs)?;
     if verbose {
         eprintln!("{}", config::line("crawl", "concurrency", &concurrency.to_string(), concurrency_src));

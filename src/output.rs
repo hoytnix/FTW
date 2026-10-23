@@ -223,13 +223,21 @@ pub fn format_host_check_verbose(elapsed: Duration, record: &HostCheckRecord) ->
     )
 }
 
-/// One stdout line per crawled page: `<url> <status-or-error>`.
+/// One stdout line per crawled page as JSON: url, absolute depth from the
+/// host root, and the status or error.
 #[must_use]
-pub fn format_crawl_page(url: &str, status: Option<u16>, error: Option<&str>) -> String {
+pub fn format_crawl_page(
+    url: &str,
+    status: Option<u16>,
+    error: Option<&str>,
+    depth: usize,
+) -> String {
+    let mut value = serde_json::json!({ "url": url, "depth": depth });
     match status {
-        Some(status) => format!("{url} {status}\n"),
-        None => format!("{url} error:{}\n", error.unwrap_or("other")),
+        Some(status) => value["status"] = serde_json::json!(status),
+        None => value["error"] = serde_json::json!(error.unwrap_or("other")),
     }
+    format!("{value}\n")
 }
 
 /// One verbose stderr line per crawled page: elapsed time, depth, URL, final
@@ -410,7 +418,12 @@ pub async fn run_crawl_db_writer(
             CrawlEvent::Page(page) => {
                 stats.record_page(&page);
                 db::upsert_crawl_page(&conn, &page).map_err(db_error)?;
-                let line = format_crawl_page(&page.url, page.status, page.error.as_deref());
+                let line = format_crawl_page(
+                    &page.url,
+                    page.status,
+                    page.error.as_deref(),
+                    page.depth,
+                );
                 if !options.quiet {
                     emit_stdout(&line);
                 }

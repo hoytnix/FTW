@@ -634,6 +634,53 @@ fn removed_file_flags_are_rejected() {
     remove_db(&db_path);
 }
 
+/// `--max-depth 0` and values below -1 are rejected as CLI errors; -1 and
+/// values >= 1 are accepted.
+#[test]
+fn crawl_rejects_invalid_max_depth() {
+    let tag = temp_tag("max-depth");
+    let db_path = temp_path(&tag, "db");
+    for bad in ["0", "-2", "-100"] {
+        let output = Command::new(ftw_bin())
+            .args([
+                "crawl",
+                "--db",
+                &db_path.to_string_lossy(),
+                "--max-depth",
+                bad,
+            ])
+            .output()
+            .expect("run ftw crawl with bad max-depth");
+        assert!(
+            !output.status.success(),
+            "--max-depth {bad} must be rejected"
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stderr).contains("max_depth"),
+            "rejection names the key: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    for good in ["-1", "1", "5"] {
+        let output = Command::new(ftw_bin())
+            .args([
+                "crawl",
+                "--db",
+                &db_path.to_string_lossy(),
+                "--max-depth",
+                good,
+            ])
+            .output()
+            .expect("run ftw crawl with good max-depth");
+        assert!(
+            output.status.success(),
+            "--max-depth {good} must be accepted: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+    remove_db(&db_path);
+}
+
 /// End-to-end chain: scan → fingerprint → crawl against a 3-page site
 /// (root links to /b, /b links to /c, /c links back to root plus an external
 /// link). Crawl must visit exactly the 3 local pages, record the external

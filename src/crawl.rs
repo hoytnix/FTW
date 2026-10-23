@@ -41,7 +41,9 @@ const CHANNEL_CAPACITY: usize = 1024;
 pub struct CrawlConfig {
     pub concurrency: usize,
     pub timeout: Duration,
-    pub max_depth: usize,
+    /// Maximum absolute URL depth to fetch (`-1` = no limit). Depth is
+    /// counted from the host root (`/` is 1), not from the seed.
+    pub max_depth: i64,
     pub max_pages: usize,
     pub body_cap: usize,
     pub max_redirects: usize,
@@ -235,8 +237,41 @@ fn should_skip(url: &reqwest::Url) -> bool {
     })
 }
 
-/// One frontier entry: the normalized URL, its depth (seeds are 0), its
-/// parent, and the seed scope it must stay inside.
+/// Absolute depth of a URL from the host root: 1 plus the number of
+/// non-empty path segments, after normalization. The fragment is already
+/// gone from normalized URLs and the query never affects the path; a
+/// trailing slash (except root) is stripped and `/index.html` and
+/// `/index.htm` count as their directory. So `/` is 1, `/index.html` is
+/// 1, `/foobar` and `/foobar/` are 2, `/foobar/index.html` is 2,
+/// `/foobar/lorem` is 3, and `/foobar/lorem/ipsum` is 4. Returns `None`
+/// when the URL does not parse.
+#[must_use]
+pub fn url_depth(normalized_url: &str) -> Option<usize> {
+    let url = reqwest::Url::parse(normalized_url).ok()?;
+    let mut path = url.path().to_string();
+    while path.len() > 1 && path.ends_with('/') {
+        path.pop();
+    }
+    for index in ["index.html", "index.htm"] {
+        let suffixed = format!("/{index}");
+        if path == suffixed {
+            path = "/".to_string();
+            break;
+        }
+        if let Some(dir) = path.strip_suffix(suffixed.as_str()) {
+            path = if dir.is_empty() {
+                "/".to_string()
+            } else {
+                dir.to_string()
+            };
+            break;
+        }
+    }
+    Some(1 + path.split('/').filter(|segment| !segment.is_empty()).count())
+}
+
+/// One frontier entry: the normalized URL, its absolute depth (`/` is 1),
+/// its parent, and the seed scope it must stay inside.
 struct CrawlJob {
     url: String,
     depth: usize,
@@ -474,10 +509,15 @@ pub async fn run_with_options(
         let Some(scope) = SeedScope::from_url(&seed_url) else {
             continue;
         };
+        // Seeds are always fetched, even when their own depth exceeds
+        // max_depth — the depth gate below then follows none of their links.
+        let Some(depth) = url_depth(&normalized) else {
+            continue;
+        };
         if visited.insert(normalized.clone()) {
             frontier.push_back(CrawlJob {
                 url: normalized,
-                depth: 0,
+                depth,
                 parent: None,
                 scope,
             });
@@ -538,13 +578,17 @@ pub async fn run_with_options(
             continue;
         }
         // The coordinator alone decides visitedness, depth, scope, skips,
-        // and the page budget — workers never enqueue themselves.
+        // and the page budget — workers never enqueue themselves. Depth is
+        // absolute from the host root, never hop count from the seed.
+        let job_over_depth =
+            config.max_depth != -1 && outcome.job.depth as i64 > config.max_depth;
         for link in outcome.links {
             if visited.len() >= config.max_pages {
                 break;
             }
-            let depth = outcome.job.depth + 1;
-            if depth > config.max_depth {
+            // An over-deep page (only possible for seeds, which are always
+            // fetched) is recorded but none of its links are followed.
+            if job_over_depth {
                 continue;
             }
             if link.external {
@@ -557,6 +601,12 @@ pub async fn run_with_options(
                 continue;
             }
             if should_skip(&url) {
+                continue;
+            }
+            let Some(depth) = url_depth(&link.url) else {
+                continue;
+            };
+            if config.max_depth != -1 && depth as i64 > config.max_depth {
                 continue;
             }
             if visited.insert(link.url.clone()) {
@@ -586,7 +636,7 @@ mod tests {
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
-    fn test_config(max_depth: usize, max_pages: usize) -> CrawlConfig {
+    fn test_config(max_depth: i64, max_pages: usize) -> CrawlConfig {
         CrawlConfig {
             concurrency: 8,
             timeout: Duration::from_secs(5),
@@ -977,21 +1027,44 @@ mod tests {
         remove_db(&db_path);
     }
 
-    /// `--max-depth 1` visits only the seed and its direct children.
+    #[test]
+    fn url_depth_counts_segments_from_the_host_root() {
+        for (raw, want) in [
+            ("http://h/", 1),
+            ("http://h/index.html", 1),
+            ("http://h/index.htm", 1),
+            ("http://h/foobar", 2),
+            ("http://h/foobar/", 2),
+            ("http://h/foobar/index.html", 2),
+            ("http://h/foobar/index.htm", 2),
+            ("http://h/foobar/lorem", 3),
+            ("http://h/foobar/lorem/ipsum", 4),
+            // Queries never matter; fragments are already stripped.
+            ("http://h/foobar?a=b&c=d", 2),
+            ("http://h/foobar/?a=b", 2),
+            ("http://h/foobar#frag", 2),
+        ] {
+            assert_eq!(url_depth(raw), Some(want), "depth of {raw}");
+        }
+        assert_eq!(url_depth("not a url"), None);
+    }
+
+    /// `--max-depth 1` fetches the seed page (`/`, depth 1) but follows none
+    /// of its links: `/b` is extracted and recorded, never visited.
     #[tokio::test]
-    async fn crawl_respects_max_depth_one() {
+    async fn crawl_max_depth_one_fetches_only_the_seed_page() {
         let db_path = temp_db("depth");
         let (addr, server) = spawn_route_server_with(|addr| {
             let base = format!("http://{addr}");
             let mut routes = HashMap::new();
-            routes.insert("/a".to_string(), html_page("A", &[format!("{base}/b")]));
+            routes.insert("/".to_string(), html_page("Root", &[format!("{base}/b")]));
             routes.insert("/b".to_string(), html_page("B", &[format!("{base}/c")]));
             routes.insert("/c".to_string(), html_page("C", &[]));
             routes
         })
         .await;
         let base = format!("http://{addr}");
-        seed_fingerprint(&db_path, addr.port(), &format!("{base}/a"), 200);
+        seed_fingerprint(&db_path, addr.port(), &format!("{base}/"), 200);
         let stats = run_with_options(
             &test_config(1, 100),
             db_path.clone(),
@@ -1001,16 +1074,165 @@ mod tests {
         .expect("crawl run");
         server.abort();
 
-        assert_eq!(stats.visited, 2);
-        let mut urls = page_urls(&db_path);
-        urls.sort_unstable();
-        assert_eq!(urls, vec![format!("{base}/a"), format!("{base}/b")]);
-        // B→C was extracted (recorded) but is too deep to visit.
+        assert_eq!(stats.visited, 1);
+        assert_eq!(page_urls(&db_path), vec![format!("{base}/")]);
+        // /b was extracted (recorded) but is too deep to visit.
         assert!(
-            link_pairs(&db_path).contains(&(format!("{base}/b"), format!("{base}/c"))),
+            link_pairs(&db_path).contains(&(format!("{base}/"), format!("{base}/b"))),
             "over-depth links are recorded even though they are never visited"
         );
         remove_db(&db_path);
+    }
+
+    /// An over-deep seed is still fetched, but none of its links are
+    /// followed — even one that would otherwise be within the limit.
+    #[tokio::test]
+    async fn crawl_over_deep_seed_is_fetched_but_followed_nowhere() {
+        let db_path = temp_db("deep-seed");
+        let (addr, server) = spawn_route_server_with(|addr| {
+            let base = format!("http://{addr}");
+            let mut routes = HashMap::new();
+            routes.insert(
+                "/a/b".to_string(),
+                html_page("AB", &[format!("{base}/")]),
+            );
+            routes.insert("/".to_string(), html_page("Root", &[]));
+            routes
+        })
+        .await;
+        let base = format!("http://{addr}");
+        seed_fingerprint(&db_path, addr.port(), &format!("{base}/a/b"), 200);
+        let stats = run_with_options(
+            &test_config(1, 100),
+            db_path.clone(),
+            output::OutputOptions::default(),
+        )
+        .await
+        .expect("crawl run");
+        server.abort();
+
+        assert_eq!(stats.visited, 1, "only the over-deep seed is fetched");
+        assert_eq!(page_urls(&db_path), vec![format!("{base}/a/b")]);
+        assert!(
+            link_pairs(&db_path).contains(&(format!("{base}/a/b"), format!("{base}/"))),
+            "the seed's links are recorded even though none are followed"
+        );
+        remove_db(&db_path);
+    }
+
+    fn page_depths(db_path: &std::path::Path) -> Vec<(String, i64)> {
+        let conn = rusqlite::Connection::open(db_path).expect("open db");
+        let mut stmt = conn
+            .prepare("SELECT url, depth FROM crawl_pages ORDER BY url")
+            .expect("prepare depths");
+        stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .expect("map depths")
+            .collect::<Result<_, _>>()
+            .expect("collect depths")
+    }
+
+    /// Absolute depth end to end: `/` → `/foobar` → `/foobar/lorem` →
+    /// `/foobar/lorem/ipsum` is cut off exactly where `--max-depth` says,
+    /// `-1` fetches everything, and index pages count as their directory.
+    #[tokio::test]
+    async fn crawl_max_depth_filters_by_absolute_url_depth() {
+        let (addr, server) = spawn_route_server_with(|addr| {
+            let base = format!("http://{addr}");
+            let mut routes = HashMap::new();
+            routes.insert(
+                "/".to_string(),
+                html_page("Root", &[format!("{base}/foobar")]),
+            );
+            routes.insert(
+                "/foobar".to_string(),
+                html_page("Foobar", &[format!("{base}/foobar/lorem")]),
+            );
+            routes.insert(
+                "/foobar/lorem".to_string(),
+                html_page("Lorem", &[format!("{base}/foobar/lorem/ipsum")]),
+            );
+            routes.insert(
+                "/foobar/lorem/ipsum".to_string(),
+                html_page("Ipsum", &[]),
+            );
+            routes.insert("/index.html".to_string(), html_page("Index", &[]));
+            routes.insert(
+                "/foobar/index.html".to_string(),
+                html_page("FoobarIndex", &[]),
+            );
+            routes
+        })
+        .await;
+        let base = format!("http://{addr}");
+
+        async fn run_at(base: &str, port: u16, seed_path: &str, max_depth: i64, n: u32) -> (Vec<String>, Vec<(String, i64)>) {
+            let db_path = temp_db(&format!("absdepth-{max_depth}-{n}"));
+            seed_fingerprint(&db_path, port, &format!("{base}{seed_path}"), 200);
+            run_with_options(
+                &test_config(max_depth, 100),
+                db_path.clone(),
+                output::OutputOptions::default(),
+            )
+            .await
+            .expect("crawl run");
+            let mut urls = page_urls(&db_path);
+            urls.sort_unstable();
+            let depths = page_depths(&db_path);
+            remove_db(&db_path);
+            (urls, depths)
+        }
+
+        let (urls, _) = run_at(&base, addr.port(), "/", 1, 0).await;
+        assert_eq!(urls, vec![format!("{base}/")], "depth 1 fetches only /");
+
+        let (urls, _) = run_at(&base, addr.port(), "/", 2, 1).await;
+        assert_eq!(
+            urls,
+            vec![format!("{base}/"), format!("{base}/foobar")],
+            "depth 2 adds /foobar but nothing deeper"
+        );
+
+        let (urls, _) = run_at(&base, addr.port(), "/", 3, 2).await;
+        assert_eq!(
+            urls,
+            vec![
+                format!("{base}/"),
+                format!("{base}/foobar"),
+                format!("{base}/foobar/lorem"),
+            ],
+            "depth 3 adds /foobar/lorem but not /foobar/lorem/ipsum"
+        );
+
+        let (urls, depths) = run_at(&base, addr.port(), "/", -1, 3).await;
+        assert_eq!(
+            urls,
+            vec![
+                format!("{base}/"),
+                format!("{base}/foobar"),
+                format!("{base}/foobar/lorem"),
+                format!("{base}/foobar/lorem/ipsum"),
+            ],
+            "no limit fetches the whole chain"
+        );
+        assert_eq!(
+            depths,
+            vec![
+                (format!("{base}/"), 1),
+                (format!("{base}/foobar"), 2),
+                (format!("{base}/foobar/lorem"), 3),
+                (format!("{base}/foobar/lorem/ipsum"), 4),
+            ],
+            "every page records its absolute depth"
+        );
+
+        let (urls, depths) = run_at(&base, addr.port(), "/index.html", 1, 4).await;
+        assert_eq!(urls, vec![format!("{base}/index.html")]);
+        assert_eq!(depths, vec![(format!("{base}/index.html"), 1)]);
+
+        let (urls, depths) = run_at(&base, addr.port(), "/foobar/index.html", 2, 5).await;
+        assert_eq!(urls, vec![format!("{base}/foobar/index.html")]);
+        assert_eq!(depths, vec![(format!("{base}/foobar/index.html"), 2)]);
+        server.abort();
     }
 
     /// Non-HTML bodies record status and content type with no link extraction

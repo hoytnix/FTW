@@ -103,9 +103,18 @@
   tag-triggered release workflow. Release-workflow glibc fix (Linux .debs
   in `rust:1-bookworm` container, glibc 2.36 baseline) left uncommitted
   in the working tree for review; takes effect on next tag push.
+- Done: v0.2.5 released (tag pushed; Bookworm-container Linux .debs built
+  clean in CI). User confirmed the arm64 .deb works (installs/runs where
+  the old glibc 2.38/2.39 build failed).
 - Done: `ftw host-check` seeds from `--db` (no YAML inventory; `--inventory`
   rejected pointing at `--db`). Build/clippy clean, 112/112 tests green
-  (96 unit + 16 CLI). Left uncommitted.
+  (96 unit + 16 CLI). Committed and pushed (b26057d).
+- WIP: `ftw crawl --max-depth` is now an absolute URL depth from the host
+  root (`/` = 1, default -1 = no limit; 0 and < -1 rejected). New
+  `url_depth()` in `src/crawl.rs`, seeds always fetched, over-deep pages
+  followed nowhere, `depth` in every streamed JSONL line and the DB.
+  Build/clippy clean, 117/117 tests green (100 unit + 17 CLI). Left
+  uncommitted for review; not pushed.
 - Done 2026-10-23: README.md documents `ftw probe` + `ftw host-check`
   (behavior, flags, inventory rules, `[probe]`/`[host_check]` config, DB
   tables, full-run queries). Left uncommitted.

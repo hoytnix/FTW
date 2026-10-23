@@ -10,7 +10,7 @@
                        \__|         \__|   \__/     \__|
                              >> FUCK TEH WORLD
     Event-Driven Asynchronous Multi-Threaded TCP Port Scanner + HTTP Probe 
-                                    v0.2.5
+                                    v0.2.6
 ================================================================================
                      .o.                  .-"""-.
                     /o o\                / .--. \
@@ -165,15 +165,21 @@ Only `<a href>` links on `text/html` pages; `/wp-admin`, logouts, deletes,
 and `action=` URLs are recorded but never visited. Bodies are streamed to a
 cap and never stored — only metadata and links.
 
+Depth is absolute from the host root (`/` is 1, `/index.html` is 1,
+`/a` is 2, `/a/b` is 3), never hop count from the seed. Seeds are always
+fetched; an over-deep seed is recorded but none of its links are followed.
+Each streamed stdout line is one JSON object with `url`, `depth`, and the
+`status` or `error`.
+
 ```sh
-ftw crawl --db ftw.db --max-depth 2 --requests-per-minute 60
+ftw crawl --db ftw.db --max-depth 3 --requests-per-minute 60
 ```
 
 | flag | default | meaning |
 |------|---------|---------|
 | `--concurrency` | `100` | max fetches in flight |
 | `--timeout` | `5` | seconds per fetch |
-| `--max-depth` | `2` | link depth (0 = seed pages) |
+| `--max-depth` | `-1` | max URL depth from host root (`/` = 1); `-1` = no limit |
 | `--max-pages` | `1000` | total page budget |
 | `--body-cap` | `262144` | max body bytes parsed per page |
 | `--max-redirects` | `5` | redirect limit per page |
@@ -299,7 +305,7 @@ prefer_https = true
 [crawl]
 concurrency = 100
 timeout = 5
-max_depth = 2
+max_depth = -1   # -1 = no limit; otherwise >= 1, absolute from host root
 max_pages = 1000
 body_cap = 262144
 max_redirects = 5
@@ -338,7 +344,7 @@ config: crawl.concurrency = 20 (cli)
 # 1. write targets.yml with YOUR ranges, then:
 ftw scan --input targets.yml --ports 80,443
 ftw fingerprint --scheme auto
-ftw crawl --max-depth 2 --requests-per-minute 60 --verbose
+ftw crawl --max-depth 3 --requests-per-minute 60 --verbose
 # new tech, same db:
 ftw host-check > host-check.jsonl
 ftw probe --host-check host-check.jsonl --verbose
