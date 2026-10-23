@@ -1,9 +1,10 @@
-//! HTTP/HTTPS probe logic for Phase 2 (`ftw probe`).
+//! HTTP/HTTPS fingerprinting logic for Phase 2 (`ftw fingerprint`).
 //!
-//! Input is a Phase 1 scan-output file ONLY: lines of `<ip>:<port> <status>`.
-//! Only entries marked `open` are kept (deduplicated). Closed and filtered
-//! ports are never re-probed, the original YAML targets file is never
-//! re-expanded, and no port absent from the scan output is ever probed.
+//! Input is the master SQLite database ONLY: `scan_results` rows marked
+//! `open` by `ftw scan`. Closed and filtered ports are never re-probed, the
+//! original YAML targets file is never re-expanded, and no port absent from
+//! the database is ever probed. Results are upserted back into the same
+//! database (`fingerprint_results`) — there are no output files.
 //!
 //! Each open host:port is probed per scheme attempt with a clear FTW
 //! User-Agent, redirects followed up to the configured limit, and at most
@@ -19,10 +20,9 @@
 //! kept in memory for parsing only — never written to the output, never
 //! re-fetched, and never followed with extra requests.
 
-use std::collections::HashSet;
 use std::fmt;
 use std::net::{IpAddr, SocketAddr};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -35,7 +35,7 @@ use crate::tech;
 
 const CHANNEL_CAPACITY: usize = 1024;
 
-/// Which scheme(s) to probe with.
+/// Which scheme(s) to try.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, clap::ValueEnum)]
 pub enum Scheme {
     /// Try HTTPS first, then fall back to plain HTTP if HTTPS fails.
@@ -96,9 +96,9 @@ impl fmt::Display for FetchMode {
     }
 }
 
-/// Runtime settings for a probe run.
+/// Runtime settings for a fingerprint run.
 #[derive(Debug, Clone, Copy)]
-pub struct ProbeConfig {
+pub struct FingerprintConfig {
     pub concurrency: usize,
     pub timeout: Duration,
     pub scheme: Scheme,
@@ -108,12 +108,12 @@ pub struct ProbeConfig {
     pub fetch_mode: FetchMode,
 }
 
-/// One JSON-lines probe record.
+/// One JSON-lines fingerprint record.
 ///
 /// `status`/`server` are `None` when no HTTP response was received; `error`
 /// is `None` exactly when a response was received (`http` outcome).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct ProbeRecord {
+pub struct FingerprintRecord {
     pub ip: String,
     pub port: u16,
     pub scheme: String,
@@ -140,9 +140,9 @@ pub struct ProbeRecord {
     pub head_status: Option<u16>,
 }
 
-/// Aggregate counts for one probe run.
+/// Aggregate counts for one fingerprint run.
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
-pub struct ProbeStats {
+pub struct FingerprintStats {
     pub total: usize,
     pub http: usize,
     pub tls_errors: usize,
@@ -153,8 +153,8 @@ pub struct ProbeStats {
     pub php_not_detected: usize,
 }
 
-impl ProbeStats {
-    pub(crate) fn record(&mut self, result: &ProbeRecord) {
+impl FingerprintStats {
+    pub(crate) fn record(&mut self, result: &FingerprintRecord) {
         self.total += 1;
         match result.error.as_deref() {
             None => self.http += 1,
@@ -171,92 +171,10 @@ impl ProbeStats {
     }
 }
 
-/// Failure to load or parse a scan-output file.
-#[derive(Debug)]
-pub enum ScanParseError {
-    Io(std::io::Error),
-    BadLine { line: usize, text: String },
-}
-
-impl fmt::Display for ScanParseError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Io(err) => write!(f, "cannot read scan-output file: {err}"),
-            Self::BadLine { line, text } => {
-                write!(f, "invalid scan-output line {line}: {text:?}")
-            }
-        }
-    }
-}
-
-impl std::error::Error for ScanParseError {
-    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
-        match self {
-            Self::Io(err) => Some(err),
-            Self::BadLine { .. } => None,
-        }
-    }
-}
-
-impl From<std::io::Error> for ScanParseError {
-    fn from(err: std::io::Error) -> Self {
-        Self::Io(err)
-    }
-}
-
-/// Parse scan-output text: keep only entries marked `open`, deduplicated and
-/// sorted. Every other status (closed, filtered, anything else) is skipped,
-/// so those ports are never probed.
-pub fn parse_scan_text(text: &str) -> Result<Vec<(IpAddr, u16)>, ScanParseError> {
-    let mut open: HashSet<(IpAddr, u16)> = HashSet::new();
-    for (index, raw_line) in text.lines().enumerate() {
-        let line = raw_line.trim();
-        if line.is_empty() {
-            continue;
-        }
-        let mut parts = line.split_whitespace();
-        let (Some(addr_part), Some(status), None) =
-            (parts.next(), parts.next(), parts.next())
-        else {
-            return Err(ScanParseError::BadLine {
-                line: index + 1,
-                text: raw_line.to_string(),
-            });
-        };
-        if status != "open" {
-            continue;
-        }
-        let Some((ip_text, port_text)) = addr_part.rsplit_once(':') else {
-            return Err(ScanParseError::BadLine {
-                line: index + 1,
-                text: raw_line.to_string(),
-            });
-        };
-        let ip: IpAddr = ip_text.parse().map_err(|_| ScanParseError::BadLine {
-            line: index + 1,
-            text: raw_line.to_string(),
-        })?;
-        let port: u16 = port_text.parse().map_err(|_| ScanParseError::BadLine {
-            line: index + 1,
-            text: raw_line.to_string(),
-        })?;
-        open.insert((ip, port));
-    }
-    let mut targets: Vec<(IpAddr, u16)> = open.into_iter().collect();
-    targets.sort_unstable();
-    Ok(targets)
-}
-
-/// Load and parse a Phase 1 scan-output file.
-pub fn parse_scan_output(path: &Path) -> Result<Vec<(IpAddr, u16)>, ScanParseError> {
-    let text = std::fs::read_to_string(path)?;
-    parse_scan_text(&text)
-}
-
 /// Build the shared HTTP client: clear FTW User-Agent, per-attempt timeout,
 /// redirect limit, and opt-in acceptance of invalid certificates (only for
 /// your own self-signed hosts).
-fn build_client(config: &ProbeConfig) -> Result<reqwest::Client, reqwest::Error> {
+fn build_client(config: &FingerprintConfig) -> Result<reqwest::Client, reqwest::Error> {
     let policy = if config.max_redirects == 0 {
         Policy::none()
     } else {
@@ -337,8 +255,9 @@ fn looks_like_connect_error(text: &str) -> bool {
 }
 
 /// Classify a failed attempt. A TLS/certificate problem is always `tls_error`
-/// — never a closed port or a connect failure.
-fn classify_error(err: &reqwest::Error) -> &'static str {
+/// — never a closed port or a connect failure. Shared with the crawler so
+/// both subcommands report the same error kinds.
+pub(crate) fn classify_error(err: &reqwest::Error) -> &'static str {
     if err.is_timeout() {
         return "timeout";
     }
@@ -422,7 +341,7 @@ fn fingerprint(headers: &HeaderMap, final_url: &str) -> (bool, Option<String>, V
 /// Stream at most `cap` response body bytes (and never more than the tech
 /// preview limit), keeping the leading bytes as a lossy string for parsing
 /// only. The preview is discarded after fingerprinting and never written to
-/// the probe output file. Larger pages are not fully fetched: only the first
+/// the output record. Larger pages are not fully fetched: only the first
 /// 65536 bytes are fingerprinted.
 async fn collect_preview(mut response: reqwest::Response, cap: usize) -> String {
     let limit = cap.min(tech::MAX_PREVIEW_BYTES);
@@ -484,7 +403,7 @@ async fn fetch_get(
 /// response, PHP + tech signals from `headers` (already unioned by the
 /// caller) and `preview`. The body preview is never stored.
 fn fill_success(
-    record: &mut ProbeRecord,
+    record: &mut FingerprintRecord,
     scheme: &str,
     status: u16,
     final_url: String,
@@ -545,7 +464,7 @@ fn fingerprint_head(headers: &HeaderMap) -> (bool, Option<String>, Vec<String>) 
 /// with an empty body preview (all HTML-derived signals are empty by
 /// definition). The body is never fetched and never stored.
 fn fill_head_success(
-    record: &mut ProbeRecord,
+    record: &mut FingerprintRecord,
     scheme: &str,
     status: u16,
     final_url: String,
@@ -604,7 +523,7 @@ fn head_failed_for_fallback(head: &Result<(u16, String, HeaderMap), reqwest::Err
     }
 }
 
-/// Probe one host:port over `scheme` with the explicit fetch mode: `get`
+/// Fingerprint one host:port over `scheme` with the explicit fetch mode: `get`
 /// sends a single `GET /`; `head` sends a single `HEAD /` (never a GET);
 /// `both` sends `HEAD /` then `GET /` always, in that order. The same client
 /// (same User-Agent, timeout, redirect limit, and TLS handling) is used for
@@ -617,9 +536,9 @@ async fn attempt(
     port: u16,
     body_cap: usize,
     fetch_mode: FetchMode,
-) -> ProbeRecord {
+) -> FingerprintRecord {
     let attempted_url = format!("{scheme}://{}/", SocketAddr::new(ip, port));
-    let mut record = ProbeRecord {
+    let mut record = FingerprintRecord {
         ip: ip.to_string(),
         port,
         scheme: scheme.to_string(),
@@ -721,14 +640,14 @@ async fn attempt(
     record
 }
 
-/// Probe one open host:port. `auto` tries HTTPS first and falls back to plain
+/// Fingerprint one open host:port. `auto` tries HTTPS first and falls back to plain
 /// HTTP only when HTTPS fails; `http`/`https` force that scheme alone.
-pub async fn probe_target(
+pub async fn fingerprint_target(
     client: &reqwest::Client,
-    config: &ProbeConfig,
+    config: &FingerprintConfig,
     ip: IpAddr,
     port: u16,
-) -> ProbeRecord {
+) -> FingerprintRecord {
     match config.scheme {
         Scheme::Http => {
             attempt(client, "http", ip, port, config.body_cap, config.fetch_mode).await
@@ -747,51 +666,54 @@ pub async fn probe_target(
     }
 }
 
-/// Probe every open target from the scan-output file.
+/// Fingerprint every open target recorded in the master database.
 ///
 /// Mirrors the Phase 1 architecture: the semaphore permit is acquired in this
 /// producer loop BEFORE `tokio::spawn`, results travel over a bounded mpsc
 /// channel to a single writer task, and records stream out as they arrive —
 /// the whole run is never buffered.
+///
+/// The database is opened once here, seeds are read, and the single
+/// connection is moved into the writer task — the only task that writes.
+/// Fingerprint workers never open connections or write directly.
 #[allow(dead_code)]
 pub async fn run(
-    config: &ProbeConfig,
-    scan_output: &Path,
-    output_path: PathBuf,
-) -> Result<ProbeStats, Box<dyn std::error::Error + Send + Sync>> {
-    run_with_options(config, scan_output, output_path, output::OutputOptions::default()).await
+    config: &FingerprintConfig,
+    db_path: PathBuf,
+) -> Result<FingerprintStats, Box<dyn std::error::Error + Send + Sync>> {
+    run_with_options(config, db_path, output::OutputOptions::default()).await
 }
 
 /// Same as [`run`], with live-output options for the single writer task.
-/// The writer remains the only place that prints per-event output; probe
+/// The writer remains the only place that prints per-event output; fingerprint
 /// tasks never print directly.
 pub async fn run_with_options(
-    config: &ProbeConfig,
-    scan_output: &Path,
-    output_path: PathBuf,
+    config: &FingerprintConfig,
+    db_path: PathBuf,
     options: output::OutputOptions,
-) -> Result<ProbeStats, Box<dyn std::error::Error + Send + Sync>> {
-    let targets = parse_scan_output(scan_output)?;
+) -> Result<FingerprintStats, Box<dyn std::error::Error + Send + Sync>> {
+    let conn = crate::db::open(&db_path)?;
+    let targets = crate::db::open_ports(&conn)?;
     if targets.is_empty() {
-        eprintln!("ftw: warning: no open ports found in scan output");
+        eprintln!("ftw: warning: no open ports found in database");
     }
     let client = build_client(config)?;
-    eprintln!("ftw: probing {} open host:port targets", targets.len());
-    let (tx, rx) = mpsc::channel::<ProbeRecord>(CHANNEL_CAPACITY);
+    eprintln!("ftw: fingerprinting {} open host:port targets", targets.len());
+    let (tx, rx) = mpsc::channel::<FingerprintRecord>(CHANNEL_CAPACITY);
     let writer =
-        tokio::spawn(async move { output::run_probe_writer_with_options(rx, output_path, options).await });
+        tokio::spawn(async move { output::run_fingerprint_db_writer(rx, conn, options).await });
     let semaphore = Arc::new(Semaphore::new(config.concurrency.max(1)));
     for (ip, port) in targets {
         let permit = semaphore
             .clone()
             .acquire_owned()
             .await
-            .expect("probe semaphore never closes while probing");
+            .expect("fingerprint semaphore never closes while fingerprinting");
         let tx = tx.clone();
         let client = client.clone();
         let config = *config;
         tokio::spawn(async move {
-            let record = probe_target(&client, &config, ip, port).await;
+            let record = fingerprint_target(&client, &config, ip, port).await;
             drop(permit);
             let _ = tx.send(record).await;
         });
@@ -804,6 +726,7 @@ pub async fn run_with_options(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -817,8 +740,8 @@ mod tests {
         format!("ftw-{prefix}-{nanos}-{}", std::process::id())
     }
 
-    fn test_config(scheme: Scheme) -> ProbeConfig {
-        ProbeConfig {
+    fn test_config(scheme: Scheme) -> FingerprintConfig {
+        FingerprintConfig {
             concurrency: 4,
             timeout: Duration::from_secs(5),
             scheme,
@@ -829,8 +752,8 @@ mod tests {
         }
     }
 
-    fn test_config_with_mode(scheme: Scheme, fetch_mode: FetchMode) -> ProbeConfig {
-        ProbeConfig {
+    fn test_config_with_mode(scheme: Scheme, fetch_mode: FetchMode) -> FingerprintConfig {
+        FingerprintConfig {
             fetch_mode,
             ..test_config(scheme)
         }
@@ -882,25 +805,92 @@ mod tests {
         tmp.local_addr().expect("temp addr").port()
     }
 
-    fn read_json_lines(path: &Path) -> Vec<serde_json::Value> {
-        let text = std::fs::read_to_string(path).expect("read probe output");
-        text.lines()
-            .map(|line| serde_json::from_str(line).expect("output line is JSON"))
-            .collect()
+    fn db_path_for(tag: &str) -> PathBuf {
+        std::env::temp_dir().join(format!("{tag}.db"))
     }
 
-    #[test]
-    fn scan_text_keeps_only_open_and_dedups() {
-        let targets = parse_scan_text(
-            "127.0.0.1:80 open\n127.0.0.1:80 open\n127.0.0.1:443 closed\n127.0.0.1:22 filtered\n\n",
-        )
-        .expect("parse scan text");
-        assert_eq!(targets.len(), 1);
-        assert_eq!(
-            targets[0],
-            ("127.0.0.1".parse().unwrap(), 80),
-            "only the open entry survives, deduplicated"
-        );
+    /// Remove a temp database and its WAL sidecars (best effort).
+    fn remove_db(db_path: &Path) {
+        std::fs::remove_file(db_path).ok();
+        std::fs::remove_file(db_path.with_extension("db-wal")).ok();
+        std::fs::remove_file(db_path.with_extension("db-shm")).ok();
+    }
+
+    /// Seed `scan_results` the way a prior `ftw scan --db` run would.
+    fn seed_scan(db_path: &Path, entries: &[(IpAddr, u16, crate::scanner::PortStatus)]) {
+        let conn = crate::db::open(db_path).expect("open db");
+        for (ip, port, status) in entries {
+            crate::db::upsert_scan(
+                &conn,
+                &crate::scanner::ScanResult {
+                    ip: *ip,
+                    port: *port,
+                    status: *status,
+                    reason: status.as_str(),
+                },
+            )
+            .expect("seed scan row");
+        }
+    }
+
+    /// Read fingerprint rows back as JSON shaped like the old JSON-lines
+    /// records, so the detection assertions below are unchanged.
+    fn read_fingerprint_records(db_path: &Path) -> Vec<serde_json::Value> {
+        let conn = rusqlite::Connection::open(db_path).expect("open db");
+        let mut stmt = conn
+            .prepare(
+                "SELECT ip, port, scheme, final_url, status, server, tls, error,
+                        php_detected, php_version, php_signals,
+                        wordpress_detected, wordpress_version, wordpress_signals,
+                        php_apps, tailwind_detected, tailwind_confidence,
+                        tailwind_signals, fetch_method, head_status
+                 FROM fingerprint_results ORDER BY port, scheme",
+            )
+            .expect("prepare query");
+        let rows = stmt
+            .query_map([], |row| {
+                let signals = |index: usize| -> Result<serde_json::Value, rusqlite::Error> {
+                    let raw: String = row.get(index)?;
+                    Ok(serde_json::from_str(&raw).unwrap_or(serde_json::Value::Null))
+                };
+                Ok(serde_json::json!({
+                    "ip": row.get::<_, String>(0)?,
+                    "port": row.get::<_, u16>(1)?,
+                    "scheme": row.get::<_, String>(2)?,
+                    "final_url": row.get::<_, String>(3)?,
+                    "status": row.get::<_, Option<u16>>(4)?,
+                    "server": row.get::<_, Option<String>>(5)?,
+                    "tls": row.get::<_, String>(6)?,
+                    "error": row.get::<_, Option<String>>(7)?,
+                    "php_detected": row.get::<_, bool>(8)?,
+                    "php_version": row.get::<_, Option<String>>(9)?,
+                    "php_signals": signals(10)?,
+                    "wordpress_detected": row.get::<_, bool>(11)?,
+                    "wordpress_version": row.get::<_, Option<String>>(12)?,
+                    "wordpress_signals": signals(13)?,
+                    "php_apps": signals(14)?,
+                    "tailwind_detected": row.get::<_, bool>(15)?,
+                    "tailwind_confidence": row.get::<_, String>(16)?,
+                    "tailwind_signals": signals(17)?,
+                    "fetch_method": row.get::<_, String>(18)?,
+                    "head_status": row.get::<_, Option<u16>>(19)?,
+                }))
+            })
+            .expect("map rows");
+        rows.collect::<Result<_, _>>().expect("collect rows")
+    }
+
+    /// An empty database fingerprints nothing and stores nothing: seeds come
+    /// from the database only, never from a scan-output file.
+    #[tokio::test]
+    async fn fingerprint_empty_database_fingerprints_nothing() {
+        let db_path = db_path_for(&temp_tag("fingerprint-empty"));
+        let stats = run(&test_config(Scheme::Http), db_path.clone())
+            .await
+            .expect("fingerprint run");
+        assert_eq!(stats.total, 0);
+        assert!(read_fingerprint_records(&db_path).is_empty());
+        remove_db(&db_path);
     }
 
     #[test]
@@ -929,31 +919,31 @@ mod tests {
     /// line and one closed entry) yields exactly one record with status 200
     /// and the test Server header — closed entries are never probed.
     #[tokio::test]
-    async fn probe_records_open_port_and_skips_closed() {
-        let tag = temp_tag("probe-open");
+    async fn fingerprint_records_open_port_and_skips_closed() {
+        let tag = temp_tag("fingerprint-open");
         let dir = std::env::temp_dir();
-        let scan_path = dir.join(format!("{tag}.scan"));
-        let out_path = dir.join(format!("{tag}.out"));
+        let db_path = dir.join(format!("{tag}.db"));
         let (server_addr, server) =
             spawn_test_server(vec![("Server".into(), "TestServer/1.0".into())], "hello").await;
         let open_port = server_addr.port();
         let closed = closed_port().await;
-        std::fs::write(
-            &scan_path,
-            format!(
-                "127.0.0.1:{open_port} open\n127.0.0.1:{open_port} open\n127.0.0.1:{closed} closed\n"
-            ),
-        )
-        .expect("write fake scan output");
+        seed_scan(
+            &db_path,
+            &[
+                ("127.0.0.1".parse().unwrap(), open_port, crate::scanner::PortStatus::Open),
+                ("127.0.0.1".parse().unwrap(), open_port, crate::scanner::PortStatus::Open),
+                ("127.0.0.1".parse().unwrap(), closed, crate::scanner::PortStatus::Closed),
+            ],
+        );
 
-        let stats = run(&test_config(Scheme::Http), &scan_path, out_path.clone())
+        let stats = run(&test_config(Scheme::Http), db_path.clone())
             .await
-            .expect("probe run");
+            .expect("fingerprint run");
         server.abort();
         assert_eq!(stats.total, 1);
         assert_eq!(stats.http, 1);
 
-        let records = read_json_lines(&out_path);
+        let records = read_fingerprint_records(&db_path);
         assert_eq!(records.len(), 1, "exactly one record for the open port");
         let record = &records[0];
         assert_eq!(record["ip"], "127.0.0.1");
@@ -964,32 +954,32 @@ mod tests {
         assert_eq!(record["tls"], "n/a");
         assert!(record["error"].is_null());
 
-        std::fs::remove_file(&scan_path).ok();
-        std::fs::remove_file(&out_path).ok();
+        remove_db(&db_path);
     }
 
     /// Probing a plain-HTTP server with `--scheme https` records a TLS error
     /// instead of crashing or reporting a connect failure.
     #[tokio::test]
-    async fn probe_https_against_plain_http_records_tls_error() {
-        let tag = temp_tag("probe-tls");
+    async fn fingerprint_https_against_plain_http_records_tls_error() {
+        let tag = temp_tag("fingerprint-tls");
         let dir = std::env::temp_dir();
-        let scan_path = dir.join(format!("{tag}.scan"));
-        let out_path = dir.join(format!("{tag}.out"));
+        let db_path = dir.join(format!("{tag}.db"));
         let (server_addr, server) =
             spawn_test_server(vec![("Server".into(), "TestServer/1.0".into())], "hello").await;
         let open_port = server_addr.port();
-        std::fs::write(&scan_path, format!("127.0.0.1:{open_port} open\n"))
-            .expect("write fake scan output");
+        seed_scan(
+            &db_path,
+            &[("127.0.0.1".parse().unwrap(), open_port, crate::scanner::PortStatus::Open)],
+        );
 
-        let stats = run(&test_config(Scheme::Https), &scan_path, out_path.clone())
+        let stats = run(&test_config(Scheme::Https), db_path.clone())
             .await
-            .expect("probe run must not crash");
+            .expect("fingerprint run must not crash");
         server.abort();
         assert_eq!(stats.total, 1);
         assert_eq!(stats.tls_errors, 1, "stats: {stats:?}");
 
-        let records = read_json_lines(&out_path);
+        let records = read_fingerprint_records(&db_path);
         assert_eq!(records.len(), 1);
         let record = &records[0];
         assert_eq!(record["scheme"], "https");
@@ -998,18 +988,16 @@ mod tests {
         assert_eq!(record["tls"], "error");
         assert_eq!(record["error"], "tls_error");
 
-        std::fs::remove_file(&scan_path).ok();
-        std::fs::remove_file(&out_path).ok();
+        remove_db(&db_path);
     }
 
     /// `X-Powered-By: PHP/8.2.0` plus a `PHPSESSID` cookie fingerprints PHP
     /// with the parsed version — from the single GET response only.
     #[tokio::test]
-    async fn probe_detects_php_from_headers_and_cookie() {
-        let tag = temp_tag("probe-php");
+    async fn fingerprint_detects_php_from_headers_and_cookie() {
+        let tag = temp_tag("fingerprint-php");
         let dir = std::env::temp_dir();
-        let scan_path = dir.join(format!("{tag}.scan"));
-        let out_path = dir.join(format!("{tag}.out"));
+        let db_path = dir.join(format!("{tag}.db"));
         let (server_addr, server) = spawn_test_server(
             vec![
                 ("Server".into(), "Apache".into()),
@@ -1019,58 +1007,67 @@ mod tests {
             "hello",
         )
         .await;
-        std::fs::write(&scan_path, format!("127.0.0.1:{} open\n", server_addr.port()))
-            .expect("write fake scan output");
+        seed_scan(
+            &db_path,
+            &[(
+                "127.0.0.1".parse().unwrap(),
+                server_addr.port(),
+                crate::scanner::PortStatus::Open,
+            )],
+        );
 
-        let stats = run(&test_config(Scheme::Http), &scan_path, out_path.clone())
+        let stats = run(&test_config(Scheme::Http), db_path.clone())
             .await
-            .expect("probe run");
+            .expect("fingerprint run");
         server.abort();
         assert_eq!(stats.php_detected, 1);
 
-        let records = read_json_lines(&out_path);
+        let records = read_fingerprint_records(&db_path);
         assert_eq!(records.len(), 1);
         let record = &records[0];
         assert_eq!(record["php_detected"], true);
         assert_eq!(record["php_version"], "8.2.0");
         assert_eq!(record["php_signals"], serde_json::json!(["x-powered-by", "phpsessid-cookie"]));
 
-        std::fs::remove_file(&scan_path).ok();
-        std::fs::remove_file(&out_path).ok();
+        remove_db(&db_path);
     }
 
     /// No PHP headers or cookies means unconfirmed — never "not PHP", just
     /// `php_detected: false` with empty signals and no version.
     #[tokio::test]
-    async fn probe_reports_no_php_without_signals() {
-        let tag = temp_tag("probe-nophp");
+    async fn fingerprint_reports_no_php_without_signals() {
+        let tag = temp_tag("fingerprint-nophp");
         let dir = std::env::temp_dir();
-        let scan_path = dir.join(format!("{tag}.scan"));
-        let out_path = dir.join(format!("{tag}.out"));
+        let db_path = dir.join(format!("{tag}.db"));
         let (server_addr, server) =
             spawn_test_server(vec![("Server".into(), "TestServer/1.0".into())], "hello").await;
-        std::fs::write(&scan_path, format!("127.0.0.1:{} open\n", server_addr.port()))
-            .expect("write fake scan output");
+        seed_scan(
+            &db_path,
+            &[(
+                "127.0.0.1".parse().unwrap(),
+                server_addr.port(),
+                crate::scanner::PortStatus::Open,
+            )],
+        );
 
-        let stats = run(&test_config(Scheme::Http), &scan_path, out_path.clone())
+        let stats = run(&test_config(Scheme::Http), db_path.clone())
             .await
-            .expect("probe run");
+            .expect("fingerprint run");
         server.abort();
         assert_eq!(stats.php_not_detected, 1);
 
-        let records = read_json_lines(&out_path);
+        let records = read_fingerprint_records(&db_path);
         assert_eq!(records.len(), 1);
         let record = &records[0];
         assert_eq!(record["php_detected"], false);
         assert!(record["php_version"].is_null());
         assert_eq!(record["php_signals"], serde_json::json!([]));
 
-        std::fs::remove_file(&scan_path).ok();
-        std::fs::remove_file(&out_path).ok();
+        remove_db(&db_path);
     }
 
     /// Test origin server that records every request path it sees, so tests
-    /// can prove probe made no request beyond the single `GET /` per scheme
+    /// can prove fingerprint made no request beyond the single `GET /` per scheme
     /// attempt (never `/wp-admin`, `/wp-login.php`, `/phpinfo.php`, ...).
     async fn spawn_path_logging_server(
         body: &'static str,
@@ -1134,7 +1131,7 @@ mod tests {
         }
     }
 
-    async fn run_single_tech_probe(
+    async fn run_single_tech_fingerprint(
         tag: String,
         body: &'static str,
     ) -> (
@@ -1143,30 +1140,34 @@ mod tests {
         String,
     ) {
         let dir = std::env::temp_dir();
-        let scan_path = dir.join(format!("{tag}.scan"));
-        let out_path = dir.join(format!("{tag}.out"));
+        let db_path = dir.join(format!("{tag}.db"));
         let (addr, paths, server) = spawn_path_logging_server(body).await;
-        std::fs::write(&scan_path, format!("127.0.0.1:{} open\n", addr.port()))
-            .expect("write fake scan output");
-        run(&test_config(Scheme::Http), &scan_path, out_path.clone())
+        seed_scan(
+            &db_path,
+            &[(
+                "127.0.0.1".parse().unwrap(),
+                addr.port(),
+                crate::scanner::PortStatus::Open,
+            )],
+        );
+        run(&test_config(Scheme::Http), db_path.clone())
             .await
-            .expect("probe run");
+            .expect("fingerprint run");
         server.abort();
-        let records = read_json_lines(&out_path);
+        let records = read_fingerprint_records(&db_path);
         assert_eq!(records.len(), 1);
         let record = records.into_iter().next().expect("one record");
-        let raw = std::fs::read_to_string(&out_path).expect("read raw output");
-        std::fs::remove_file(&scan_path).ok();
-        std::fs::remove_file(&out_path).ok();
+        let raw = serde_json::to_string(&record).expect("dump record");
+        remove_db(&db_path);
         (record, paths, raw)
     }
 
     /// WordPress fixture: generator `WordPress 6.5.2` plus a `/wp-content/`
     /// script. No WooCommerce app entry is reported.
     #[tokio::test]
-    async fn probe_detects_wordpress_with_version() {
+    async fn fingerprint_detects_wordpress_with_version() {
         let body = "<html><head><meta name=\"generator\" content=\"WordPress 6.5.2\" /><script src=\"/wp-content/themes/t/app.js\"></script></head><body>hi</body></html>";
-        let (record, paths, raw) = run_single_tech_probe(temp_tag("probe-wp"), body).await;
+        let (record, paths, raw) = run_single_tech_fingerprint(temp_tag("fingerprint-wp"), body).await;
         assert_eq!(record["wordpress_detected"], true);
         assert_eq!(record["wordpress_version"], "6.5.2");
         let signals = record["wordpress_signals"].as_array().expect("signals array");
@@ -1179,9 +1180,9 @@ mod tests {
 
     /// Joomla fixture produces the Joomla `php_apps` entry with its version.
     #[tokio::test]
-    async fn probe_detects_joomla_app_with_version() {
+    async fn fingerprint_detects_joomla_app_with_version() {
         let body = "<html><head><meta name=\"generator\" content=\"Joomla! 4.2.5\" /><script src=\"/media/system/js/core.js\"></script></head><body>hi</body></html>";
-        let (record, paths, _) = run_single_tech_probe(temp_tag("probe-joomla"), body).await;
+        let (record, paths, _) = run_single_tech_fingerprint(temp_tag("fingerprint-joomla"), body).await;
         assert_eq!(record["wordpress_detected"], false);
         let apps = record["php_apps"].as_array().expect("php_apps array");
         let joomla = apps.iter().find(|app| app["name"] == "Joomla").expect("Joomla entry");
@@ -1192,9 +1193,9 @@ mod tests {
 
     /// Drupal fixture produces the Drupal `php_apps` entry with its version.
     #[tokio::test]
-    async fn probe_detects_drupal_app_with_version() {
+    async fn fingerprint_detects_drupal_app_with_version() {
         let body = "<html><head><meta name=\"generator\" content=\"Drupal 10\" /><script src=\"/sites/default/files/js/app.js\"></script></head><body>hi</body></html>";
-        let (record, paths, _) = run_single_tech_probe(temp_tag("probe-drupal"), body).await;
+        let (record, paths, _) = run_single_tech_fingerprint(temp_tag("fingerprint-drupal"), body).await;
         assert_eq!(record["wordpress_detected"], false);
         let apps = record["php_apps"].as_array().expect("php_apps array");
         let drupal = apps.iter().find(|app| app["name"] == "Drupal").expect("Drupal entry");
@@ -1205,9 +1206,9 @@ mod tests {
 
     /// Plain HTML with no markers: no WordPress, no apps, Tailwind `"none"`.
     #[tokio::test]
-    async fn probe_plain_html_has_no_tech_signals() {
+    async fn fingerprint_plain_html_has_no_tech_signals() {
         let body = "<html><head><title>Plain</title></head><body><p>hello</p></body></html>";
-        let (record, paths, raw) = run_single_tech_probe(temp_tag("probe-plain"), body).await;
+        let (record, paths, raw) = run_single_tech_fingerprint(temp_tag("fingerprint-plain"), body).await;
         assert_eq!(record["wordpress_detected"], false);
         assert!(record["wordpress_version"].is_null());
         assert_eq!(record["wordpress_signals"], serde_json::json!([]));
@@ -1221,9 +1222,9 @@ mod tests {
 
     /// Tailwind CDN script is a strong signal: detected with confidence strong.
     #[tokio::test]
-    async fn probe_detects_tailwind_cdn_as_strong() {
+    async fn fingerprint_detects_tailwind_cdn_as_strong() {
         let body = "<html><head><script src=\"https://cdn.tailwindcss.com\"></script></head><body><div class=\"flex items-center justify-center\">hi</div></body></html>";
-        let (record, paths, _) = run_single_tech_probe(temp_tag("probe-tw"), body).await;
+        let (record, paths, _) = run_single_tech_fingerprint(temp_tag("fingerprint-tw"), body).await;
         assert_eq!(record["tailwind_detected"], true);
         assert_eq!(record["tailwind_confidence"], "strong");
         let signals = record["tailwind_signals"].as_array().expect("signals array");
@@ -1314,7 +1315,7 @@ mod tests {
         (addr, log, handle)
     }
 
-    async fn run_fetch_probe(
+    async fn run_fetch_fingerprint(
         tag: String,
         fetch_mode: FetchMode,
         head_status: u16,
@@ -1327,27 +1328,30 @@ mod tests {
         String,
     ) {
         let dir = std::env::temp_dir();
-        let scan_path = dir.join(format!("{tag}.scan"));
-        let out_path = dir.join(format!("{tag}.out"));
+        let db_path = dir.join(format!("{tag}.db"));
         let (addr, log, server) =
             spawn_method_server(head_status, head_headers, get_headers, get_body).await;
-        std::fs::write(&scan_path, format!("127.0.0.1:{} open\n", addr.port()))
-            .expect("write fake scan output");
+        seed_scan(
+            &db_path,
+            &[(
+                "127.0.0.1".parse().unwrap(),
+                addr.port(),
+                crate::scanner::PortStatus::Open,
+            )],
+        );
         run(
             &test_config_with_mode(Scheme::Http, fetch_mode),
-            &scan_path,
-            out_path.clone(),
+            db_path.clone(),
         )
         .await
-        .expect("probe run");
+        .expect("fingerprint run");
         server.abort();
-        let records = read_json_lines(&out_path);
+        let records = read_fingerprint_records(&db_path);
         assert_eq!(records.len(), 1);
         let record = records.into_iter().next().expect("one record");
-        let raw = std::fs::read_to_string(&out_path).expect("read raw output");
+        let raw = serde_json::to_string(&record).expect("dump record");
         let logged = log.lock().expect("method log").clone();
-        std::fs::remove_file(&scan_path).ok();
-        std::fs::remove_file(&out_path).ok();
+        remove_db(&db_path);
         (record, logged, raw)
     }
 
@@ -1406,8 +1410,8 @@ mod tests {
     #[tokio::test]
     async fn default_get_mode_sends_single_get() {
         let get_body = "<html><head><title>Plain</title></head><body><p>get-marker</p></body></html>";
-        let (record, log, raw) = run_fetch_probe(
-            temp_tag("probe-getdefault"),
+        let (record, log, raw) = run_fetch_fingerprint(
+            temp_tag("fingerprint-getdefault"),
             FetchMode::Get,
             200,
             Vec::new(),
@@ -1433,8 +1437,8 @@ mod tests {
             "<https://example.com/wp-json/>; rel=\"https://api.w.org/\"".to_string(),
         )];
         let get_body = "<html><head><title>Never fetched</title></head><body><p>head-body-marker</p></body></html>";
-        let (record, log, raw) = run_fetch_probe(
-            temp_tag("probe-headwp"),
+        let (record, log, raw) = run_fetch_fingerprint(
+            temp_tag("fingerprint-headwp"),
             FetchMode::Head,
             200,
             head_headers,
@@ -1464,8 +1468,8 @@ mod tests {
     #[tokio::test]
     async fn head_mode_ignores_html_only_wordpress() {
         let get_body = "<html><head><meta name=\"generator\" content=\"WordPress 6.5.2\" /><script src=\"/wp-content/themes/t/app.js\"></script></head><body><p>head-body-marker</p></body></html>";
-        let (record, log, raw) = run_fetch_probe(
-            temp_tag("probe-headhtml"),
+        let (record, log, raw) = run_fetch_fingerprint(
+            temp_tag("fingerprint-headhtml"),
             FetchMode::Head,
             200,
             Vec::new(),
@@ -1494,8 +1498,8 @@ mod tests {
     async fn both_mode_unions_php_head_and_wordpress_get() {
         let head_headers = vec![("X-Powered-By".to_string(), "PHP/8.2.0".to_string())];
         let get_body = "<html><head><meta name=\"generator\" content=\"WordPress 6.5.2\" /><script src=\"/wp-content/themes/t/app.js\"></script></head><body><p>both-marker</p></body></html>";
-        let (record, log, raw) = run_fetch_probe(
-            temp_tag("probe-bothunion"),
+        let (record, log, raw) = run_fetch_fingerprint(
+            temp_tag("fingerprint-bothunion"),
             FetchMode::Both,
             200,
             head_headers,
@@ -1533,8 +1537,8 @@ mod tests {
     #[tokio::test]
     async fn both_mode_head_405_still_gets_with_fallback() {
         let get_body = "<html><head><title>Plain</title></head><body><p>both-405-marker</p></body></html>";
-        let (record, log, raw) = run_fetch_probe(
-            temp_tag("probe-both405"),
+        let (record, log, raw) = run_fetch_fingerprint(
+            temp_tag("fingerprint-both405"),
             FetchMode::Both,
             405,
             Vec::new(),
@@ -1563,8 +1567,8 @@ mod tests {
     #[tokio::test]
     async fn head_mode_head_405_records_error_without_get() {
         let get_body = "<html><head><title>Plain</title></head><body><p>head-405-marker</p></body></html>";
-        let (record, log, _) = run_fetch_probe(
-            temp_tag("probe-head405"),
+        let (record, log, _) = run_fetch_fingerprint(
+            temp_tag("fingerprint-head405"),
             FetchMode::Head,
             405,
             Vec::new(),

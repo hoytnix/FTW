@@ -1,6 +1,6 @@
-//! Additive technology fingerprinting for `ftw probe`.
+//! Additive technology fingerprinting for `ftw fingerprint`.
 //!
-//! Input is the already-fetched probe response only: status, headers, final
+//! Input is the already-fetched fingerprint response only: status, headers, final
 //! URL, and a body preview of at most [`MAX_PREVIEW_BYTES`] bytes kept in
 //! memory for parsing and then discarded. This module makes no network
 //! requests of its own: it never fetches linked CSS/JS and never requests any
@@ -197,7 +197,7 @@ fn parse_link_rel(segment: &str) -> Option<String> {
 /// match in [`wordpress`] and the `x-magento-header` match in [`php_apps`].
 /// PHP-only headers (`X-Powered-By`, PHPSESSID) are NOT sufficient:
 /// application and Tailwind signals live in the HTML. Informational only —
-/// the probe never skips GET automatically; `--fetch-mode` decides.
+/// fingerprinting never skips GET automatically; `--fetch-mode` decides.
 /// Retained for tests and callers inspecting header-only identifiability.
 #[allow(dead_code)]
 pub fn head_identifies_app(headers: &HeaderMap) -> bool {

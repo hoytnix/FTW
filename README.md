@@ -9,7 +9,7 @@
                        $$ |         $$ |   $$  /   \$$ |
                        \__|         \__|   \__/     \__|
                         >> FUCK TEH WORLD <<
-             authorized async TCP port scanner + HTTP probe v0.1.0
+             authorized async TCP port scanner + HTTP probe v0.2.0
 ================================================================================
                      .o.                  .-"""-.
                     /o o\                / .--. \

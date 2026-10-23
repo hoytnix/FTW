@@ -1,36 +1,42 @@
-//! Streaming result writer: one task owns a `BufWriter` and writes each
-//! result to the output file as it arrives over a bounded channel.
+//! Streaming result writer: one task owns the database connection and writes
+//! each result to the master SQLite database as it arrives over a bounded
+//! channel.
 //!
-//! The writer task is the ONLY place that writes live terminal output, so
-//! event order is preserved and lines never interleave. For every event it
-//! writes the exact same line/record to stdout immediately (unless quiet),
-//! then flushes stdout AND the file writer before taking the next event —
-//! never waiting for the buffer to fill or the channel to close. Flushing
-//! per event is slower than bulk buffering on very large scans; that is the
-//! intended tradeoff: live visibility over throughput. No batching delay,
-//! no progress throttle, no flush-every-N optimization.
+//! The writer task is the ONLY place that writes to the database and the only
+//! place that prints live terminal output, so event order is preserved and
+//! lines never interleave. For every event it upserts the record into the
+//! database, writes the exact same line/record to stdout immediately (unless
+//! quiet), then flushes stdout before taking the next event — never waiting
+//! for the buffer to fill or the channel to close. Flushing per event is
+//! slower than bulk buffering on very large scans; that is the intended
+//! tradeoff: live visibility over throughput.
+//!
+//! A second FTW process opening the same database file is NOT silently
+//! absorbed: its writes wait up to the busy timeout and then fail with
+//! `SQLITE_BUSY`, which is returned here as an I/O error so the run exits
+//! non-zero instead of retrying forever.
 //!
 //! Final summaries are printed by the caller to stderr only, after the
 //! channel closes and the writer finishes, so stdout stays parseable.
 
 use std::io;
 use std::io::Write as _;
-use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use tokio::fs::File;
-use tokio::io::{AsyncWrite, AsyncWriteExt, BufWriter};
+use rusqlite::Connection;
 use tokio::sync::mpsc;
 
-use crate::probe::{ProbeRecord, ProbeStats};
+use crate::crawl::{CrawlEvent, CrawlStats};
+use crate::db;
+use crate::fingerprint::{FingerprintRecord, FingerprintStats};
 use crate::scanner::ScanResult;
 
-/// Live-output options shared by both subcommands.
+/// Live-output options shared by all subcommands.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct OutputOptions {
     /// Print one human-readable stderr line per event (elapsed + detail).
     pub verbose: bool,
-    /// Suppress all terminal output during the run (file still written,
+    /// Suppress all terminal output during the run (database still written,
     /// still flushed per event). Errors and the final summary still go to
     /// stderr.
     pub quiet: bool,
@@ -90,15 +96,15 @@ pub fn format_scan_verbose(elapsed: Duration, result: &ScanResult) -> String {
     )
 }
 
-/// One verbose stderr line per probe event: `ip:port`, the scheme actually
-/// used, fetch method and head status, HTTP status (or error), final URL,
-/// Server header when present, and detected technologies. The JSON record on
-/// stdout stays the machine-readable source of truth; this line is only for
-/// watching, and it always names both scheme and final URL so a scheme
-/// mismatch (for example a plain-HTTP request to a TLS port returning 400)
-/// is obvious from this line alone.
+/// One verbose stderr line per fingerprint event: `ip:port`, the scheme
+/// actually used, fetch method and head status, HTTP status (or error), final
+/// URL, Server header when present, and detected technologies. The JSON
+/// record on stdout stays the machine-readable source of truth; this line is
+/// only for watching, and it always names both scheme and final URL so a
+/// scheme mismatch (for example a plain-HTTP request to a TLS port returning
+/// 400) is obvious from this line alone.
 #[must_use]
-pub fn format_probe_verbose(elapsed: Duration, record: &ProbeRecord) -> String {
+pub fn format_fingerprint_verbose(elapsed: Duration, record: &FingerprintRecord) -> String {
     let head = record
         .head_status
         .map(|status| status.to_string())
@@ -163,6 +169,38 @@ pub fn format_probe_verbose(elapsed: Duration, record: &ProbeRecord) -> String {
     line
 }
 
+/// One stdout line per crawled page: `<url> <status-or-error>`.
+#[must_use]
+pub fn format_crawl_page(url: &str, status: Option<u16>, error: Option<&str>) -> String {
+    match status {
+        Some(status) => format!("{url} {status}\n"),
+        None => format!("{url} error:{}\n", error.unwrap_or("other")),
+    }
+}
+
+/// One verbose stderr line per crawled page: elapsed time, depth, URL, final
+/// URL, outcome, and how many links the page yielded.
+#[must_use]
+pub fn format_crawl_verbose(
+    elapsed: Duration,
+    url: &str,
+    final_url: Option<&str>,
+    status: Option<u16>,
+    error: Option<&str>,
+    depth: usize,
+    links_found: usize,
+) -> String {
+    let outcome = match status {
+        Some(status) => status.to_string(),
+        None => format!("error:{}", error.unwrap_or("other")),
+    };
+    format!(
+        "[+{:.2}s] depth={depth} {url} -> {} {outcome} links={links_found}\n",
+        final_url.unwrap_or("-"),
+        elapsed.as_secs_f64(),
+    )
+}
+
 /// Write one result line to the locked stdout and flush it. Stdout carries
 /// parseable results only, never diagnostics.
 fn emit_stdout(line: &str) {
@@ -172,25 +210,25 @@ fn emit_stdout(line: &str) {
     let _ = handle.flush();
 }
 
-/// Drain scan results: write each `<ip>:<port> <status>` line to `file`,
-/// duplicate it to stdout (unless quiet), print a verbose stderr line per
-/// event when requested, and flush stdout AND the file after every event.
-/// Returns per-run counts. Ends when all senders drop.
-pub async fn run_scan_stream<W>(
+fn db_error(err: rusqlite::Error) -> io::Error {
+    io::Error::other(format!("ftw: database write failed: {err}"))
+}
+
+/// Drain scan results: upsert each `<ip>:<port> <status>` result into the
+/// master database, duplicate it to stdout (unless quiet), print a verbose
+/// stderr line per event when requested, and flush stdout after every event.
+/// Returns per-run counts. Ends when all senders drop, then checkpoints WAL.
+pub async fn run_scan_db_writer(
     mut rx: mpsc::Receiver<ScanResult>,
-    file: W,
+    conn: Connection,
     options: OutputOptions,
-) -> io::Result<ScanStats>
-where
-    W: AsyncWrite + Unpin,
-{
+) -> io::Result<ScanStats> {
     let start = Instant::now();
-    let mut writer = BufWriter::new(file);
     let mut stats = ScanStats::default();
     while let Some(result) = rx.recv().await {
         stats.record(&result);
+        db::upsert_scan(&conn, &result).map_err(db_error)?;
         let line = format_result(&result);
-        writer.write_all(line.as_bytes()).await?;
         if !options.quiet {
             emit_stdout(&line);
         }
@@ -198,144 +236,105 @@ where
             eprint!("{}", format_scan_verbose(start.elapsed(), &result));
         }
         if !options.quiet {
-            // Flush the terminal copy before the file copy so a watcher
-            // never sees the file advance without the terminal matching it.
             io::stdout().flush()?;
         }
-        writer.flush().await?;
     }
+    db::checkpoint(&conn);
     Ok(stats)
 }
 
-/// Drain probe records to `file` as one JSON object per line, duplicating
-/// each record to stdout (unless quiet) and printing a verbose stderr line
-/// per event when requested. Flushes stdout AND the file after every event.
-/// Returns per-run counts. Ends when all senders drop.
-pub async fn run_probe_stream<W>(
-    mut rx: mpsc::Receiver<ProbeRecord>,
-    file: W,
+/// Drain fingerprint records: upsert each record into the master database as
+/// well as duplicating it to stdout as one JSON object per line (unless
+/// quiet), with a verbose stderr line per event when requested. Flushes
+/// stdout after every event. Returns per-run counts. Ends when all senders
+/// drop, then checkpoints WAL.
+pub async fn run_fingerprint_db_writer(
+    mut rx: mpsc::Receiver<FingerprintRecord>,
+    conn: Connection,
     options: OutputOptions,
-) -> io::Result<ProbeStats>
-where
-    W: AsyncWrite + Unpin,
-{
+) -> io::Result<FingerprintStats> {
     let start = Instant::now();
-    let mut writer = BufWriter::new(file);
-    let mut stats = ProbeStats::default();
+    let mut stats = FingerprintStats::default();
     while let Some(record) = rx.recv().await {
         stats.record(&record);
+        db::upsert_fingerprint(&conn, &record).map_err(db_error)?;
         let mut line =
             serde_json::to_string(&record).map_err(|err| io::Error::other(err.to_string()))?;
         line.push('\n');
-        writer.write_all(line.as_bytes()).await?;
         if !options.quiet {
             emit_stdout(&line);
         }
         if options.verbose {
-            eprint!("{}", format_probe_verbose(start.elapsed(), &record));
+            eprint!("{}", format_fingerprint_verbose(start.elapsed(), &record));
         }
         if !options.quiet {
             io::stdout().flush()?;
         }
-        writer.flush().await?;
     }
+    db::checkpoint(&conn);
     Ok(stats)
 }
 
-/// Drain `rx` to `path` with live stdout duplication (unless quiet) and an
-/// optional per-event verbose line to stderr. Returns per-run counts.
-pub async fn run_writer_with_options(
-    rx: mpsc::Receiver<ScanResult>,
-    path: PathBuf,
+/// Drain crawl events: upsert each visited page and record each extracted
+/// link in the master database, print one stdout line per visited page
+/// (unless quiet), and print a verbose stderr line per page when requested.
+/// Flushes stdout after every event. Returns per-run counts. Ends when all
+/// senders drop, then checkpoints WAL.
+pub async fn run_crawl_db_writer(
+    mut rx: mpsc::Receiver<CrawlEvent>,
+    conn: Connection,
     options: OutputOptions,
-) -> io::Result<ScanStats> {
-    let file = File::create(&path).await?;
-    run_scan_stream(rx, file, options).await
-}
-
-/// Drain `rx` to `path`. Returns when all senders drop. Live stdout
-/// duplication is on by default (matching the CLI default).
-#[allow(dead_code)]
-pub async fn run_writer(
-    rx: mpsc::Receiver<ScanResult>,
-    path: PathBuf,
-) -> io::Result<()> {
-    run_writer_with_options(rx, path, OutputOptions::default()).await?;
-    Ok(())
-}
-
-/// Drain probe records to `path` as one JSON object per line with live
-/// stdout duplication (unless quiet) and an optional per-event verbose line
-/// to stderr. Returns per-run counts. Returns when all senders drop.
-pub async fn run_probe_writer_with_options(
-    rx: mpsc::Receiver<ProbeRecord>,
-    path: PathBuf,
-    options: OutputOptions,
-) -> io::Result<ProbeStats> {
-    let file = File::create(&path).await?;
-    run_probe_stream(rx, file, options).await
-}
-
-/// Drain probe records to `path` as one JSON object per line. Returns
-/// per-run counts. Returns when all senders drop. Live stdout duplication
-/// is on by default (matching the CLI default).
-#[allow(dead_code)]
-pub async fn run_probe_writer(
-    rx: mpsc::Receiver<ProbeRecord>,
-    path: PathBuf,
-) -> io::Result<ProbeStats> {
-    run_probe_writer_with_options(rx, path, OutputOptions::default()).await
+) -> io::Result<CrawlStats> {
+    let start = Instant::now();
+    let mut stats = CrawlStats::default();
+    while let Some(event) = rx.recv().await {
+        match event {
+            CrawlEvent::Page(page) => {
+                stats.record_page(&page);
+                db::upsert_crawl_page(&conn, &page).map_err(db_error)?;
+                let line = format_crawl_page(&page.url, page.status, page.error.as_deref());
+                if !options.quiet {
+                    emit_stdout(&line);
+                }
+                if options.verbose {
+                    eprint!(
+                        "{}",
+                        format_crawl_verbose(
+                            start.elapsed(),
+                            &page.url,
+                            page.final_url.as_deref(),
+                            page.status,
+                            page.error.as_deref(),
+                            page.depth,
+                            page.links_found,
+                        )
+                    );
+                }
+                if !options.quiet {
+                    io::stdout().flush()?;
+                }
+            }
+            CrawlEvent::Link { from_url, to_url, external } => {
+                stats.record_link(external);
+                db::insert_crawl_link(&conn, &from_url, &to_url).map_err(db_error)?;
+            }
+        }
+    }
+    db::checkpoint(&conn);
+    Ok(stats)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::pin::Pin;
-    use std::sync::{Arc, Mutex};
-    use std::task::{Context, Poll};
+    use std::time::{SystemTime, UNIX_EPOCH};
 
-    /// Shared in-memory async sink that counts flushes, proving
-    /// flush-per-event. `Clone` shares the same counters so the writer task
-    /// can own one handle while the test observes the other.
-    #[derive(Debug, Clone, Default)]
-    struct SharedMock {
-        inner: Arc<Mutex<MockInner>>,
-    }
-
-    #[derive(Debug, Default)]
-    struct MockInner {
-        written: Vec<u8>,
-        flushes: usize,
-    }
-
-    impl SharedMock {
-        fn flushes(&self) -> usize {
-            self.inner.lock().expect("mock lock").flushes
-        }
-    }
-
-    impl AsyncWrite for SharedMock {
-        fn poll_write(
-            self: Pin<&mut Self>,
-            _cx: &mut Context<'_>,
-            buf: &[u8],
-        ) -> Poll<io::Result<usize>> {
-            self.inner
-                .lock()
-                .expect("mock lock")
-                .written
-                .extend_from_slice(buf);
-            Poll::Ready(Ok(buf.len()))
-        }
-
-        fn poll_flush(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            self.inner.lock().expect("mock lock").flushes += 1;
-            Poll::Ready(Ok(()))
-        }
-
-        fn poll_shutdown(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-            Poll::Ready(Ok(()))
-        }
+    fn temp_db(tag: &str) -> std::path::PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        std::env::temp_dir().join(format!("ftw-outtest-{tag}-{nanos}-{}.db", std::process::id()))
     }
 
     fn scan_result(ip: &str, port: u16, status: crate::scanner::PortStatus) -> ScanResult {
@@ -347,8 +346,8 @@ mod tests {
         }
     }
 
-    fn probe_record(port: u16) -> ProbeRecord {
-        ProbeRecord {
+    fn fingerprint_record(port: u16) -> FingerprintRecord {
+        FingerprintRecord {
             ip: "127.0.0.1".to_string(),
             port,
             scheme: "http".to_string(),
@@ -372,14 +371,15 @@ mod tests {
         }
     }
 
-    /// Three scan events through the channel must flush the file writer three
-    /// times (once per event), not once at close.
+    /// The scan writer persists every event to the database (no result
+    /// files): three events, one per port, with a rerun upserting in place.
     #[tokio::test]
-    async fn scan_stream_flushes_once_per_event() {
+    async fn scan_writer_persists_events_to_database() {
+        let path = temp_db("scan");
+        let conn = db::open(&path).expect("open db");
         let (tx, rx) = mpsc::channel(8);
         let options = OutputOptions::new(false, true);
-        let mock = SharedMock::default();
-        let task = tokio::spawn(run_scan_stream(rx, mock.clone(), options));
+        let task = tokio::spawn(run_scan_db_writer(rx, conn, options));
         for port in [80u16, 443, 22] {
             tx.send(scan_result(
                 "127.0.0.1",
@@ -392,31 +392,37 @@ mod tests {
         drop(tx);
         let stats = task.await.expect("writer task").expect("writer ok");
         assert_eq!(stats.total(), 3);
-        assert_eq!(
-            mock.flushes(),
-            3,
-            "mock writer must see one flush per record, not one flush at close"
-        );
+
+        let check = db::open(&path).expect("reopen db");
+        let count: i64 = check
+            .query_row("SELECT COUNT(*) FROM scan_results", [], |row| row.get(0))
+            .expect("count rows");
+        assert_eq!(count, 3, "every event must land in the database");
+        std::fs::remove_file(&path).ok();
     }
 
-    /// Three probe records through the channel must flush three times.
+    /// The fingerprint writer persists every record to the database with its
+    /// signal arrays stored as JSON text.
     #[tokio::test]
-    async fn probe_stream_flushes_once_per_event() {
+    async fn fingerprint_writer_persists_records_to_database() {
+        let path = temp_db("fingerprint");
+        let conn = db::open(&path).expect("open db");
         let (tx, rx) = mpsc::channel(8);
         let options = OutputOptions::new(false, true);
-        let mock = SharedMock::default();
-        let task = tokio::spawn(run_probe_stream(rx, mock.clone(), options));
-        for port in [80u16, 443, 22] {
-            tx.send(probe_record(port)).await.expect("send record");
+        let task = tokio::spawn(run_fingerprint_db_writer(rx, conn, options));
+        for port in [80u16, 443] {
+            tx.send(fingerprint_record(port)).await.expect("send record");
         }
         drop(tx);
         let stats = task.await.expect("writer task").expect("writer ok");
-        assert_eq!(stats.total, 3);
-        assert_eq!(
-            mock.flushes(),
-            3,
-            "mock writer must see one flush per record, not one flush at close"
-        );
+        assert_eq!(stats.total, 2);
+
+        let check = db::open(&path).expect("reopen db");
+        let count: i64 = check
+            .query_row("SELECT COUNT(*) FROM fingerprint_results", [], |row| row.get(0))
+            .expect("count rows");
+        assert_eq!(count, 2, "every record must land in the database");
+        std::fs::remove_file(&path).ok();
     }
 
     #[test]
@@ -435,13 +441,13 @@ mod tests {
     }
 
     #[test]
-    fn probe_verbose_names_scheme_and_final_url() {
-        let mut record = probe_record(443);
+    fn fingerprint_verbose_names_scheme_and_final_url() {
+        let mut record = fingerprint_record(443);
         record.scheme = "http".to_string();
         record.status = Some(400);
         record.final_url = "http://127.0.0.1:443/".to_string();
         record.fetch_method = "get".to_string();
-        let line = format_probe_verbose(Duration::from_millis(50), &record);
+        let line = format_fingerprint_verbose(Duration::from_millis(50), &record);
         assert!(line.contains("http"), "scheme visible: {line}");
         assert!(
             line.contains("http://127.0.0.1:443/"),

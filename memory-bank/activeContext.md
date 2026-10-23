@@ -38,7 +38,16 @@ under `scan` subcommand).
    flush-per-event,
    stderr verbose lines + summaries, `cargo build` / clippy clean,
    `cargo test` 39/39 green (34 unit + 5 new CLI). Changes left uncommitted.
-9. Sync this file + progress.md; leave changes uncommitted for review.
+9. Rebrand `probe` → `fingerprint` (subcommand, module, args, docs;
+   detection/behavior unchanged), then master-SQLite improvement + new
+   `crawl` subcommand applied and verified: `cargo build` clean,
+   `cargo clippy --all-targets -- -D warnings` clean,
+   `cargo test` 60/60 green (52 unit + 8 CLI). All scan/fingerprint/crawl
+   results live in one `--db` file (default `ftw.db`); removed `--output` /
+   `--scan-output` are rejected with a clap error pointing at `--db`.
+   Single writer task owns the only connection (WAL, busy_timeout 5000,
+   synchronous NORMAL, checkpoint on exit). Changes left uncommitted.
+10. Sync this file + progress.md; leave changes uncommitted for review.
 
 ## Recent state changes
 - 2026-10-23: added hacker-zine README.md + Kopimi LICENSE; banner swapped

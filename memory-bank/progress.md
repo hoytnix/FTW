@@ -1,16 +1,31 @@
 # Progress — FTW
 
 ## Build status
+- Version `0.2.0` (`Cargo.toml`, `Cargo.lock`, README banner; `ftw --version`
+  reports `FTW 0.2.0`).
 - `cargo build` clean, 0 warnings.
-- `cargo clippy --all-targets -- -D warnings` clean (rustup stable 1.99.1
-  toolchain installed 2026-10-23 to run the gate; clippy 0.1.99).
-- `cargo test` 39/39 green (34 unit: 30 pre-existing + 4 new output
-  flush/verbose-format tests; 5 new CLI in `tests/live_output.rs`: scan
-  stdout==file, probe verbose stderr, scan quiet, probe quiet, verbose/quiet
-  conflict). Scan/probe logic, flags (apart from `--verbose`/`--quiet`),
-  and output formats unchanged.
+- `cargo clippy --all-targets -- -D warnings` clean (system stable toolchain;
+  clippy 0.1.99).
+- `cargo test` 60/60 green (52 unit + 8 CLI in `tests/live_output.rs`).
+  Scan/fingerprint detection, fetch-mode, tech, and verbose/quiet behavior
+  unchanged; results moved from files to the master SQLite database, and the
+  new `crawl` subcommand is covered (chain/cycle/external/depth, non-HTML,
+  redirects, skips, error kinds, single-writer proof, legacy-flag rejection).
 
 ## Completed modules
+- `src/db.rs` (new): master SQLite database, opened once per run (WAL,
+  busy_timeout 5000, synchronous NORMAL, `CREATE TABLE IF NOT EXISTS` +
+  indexes, checkpoint on exit). `scan_results` upsert on `(ip, port)`,
+  `fingerprint_results` upsert on `(ip, port, scheme)` with signal arrays as
+  JSON text, `crawl_pages` upsert on normalized `url`, `crawl_links`
+  `INSERT OR IGNORE`; `open_ports` / `crawl_seeds` (2xx–3xx only) seed
+  queries; structural test proving only `db.rs` executes statements and only
+  the writer path owns a connection.
+- `src/crawl.rs` (new): `ftw crawl` — coordinator-owned visited set +
+  frontier, semaphore-gated workers (permit before spawn), GET-only fetches,
+  redirect following with off-host stop, same-host scope (IP seeds also match
+  port), `<a href>`-only extraction with normalization/dedup, admin/action
+  skips, `--body-cap` streaming without storing bodies, per-kind error stats.
 - `src/targets.rs` (YAML map/sequence parse, bare-IP fallback, aggregate dedup,
   lazy cursor iterator + unit tests). Unchanged in Phase 2.
 - `src/scanner.rs` (probe open/closed/filtered + semaphore-gated `scan`).
